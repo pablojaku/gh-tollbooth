@@ -6,15 +6,19 @@ Python 3.9+. Results go to stdout; progress goes to stderr.
 
   gh-tollbooth status                           rate-limit buckets + recent calls (free)
   gh-tollbooth call [--no-cache] -- api <args>  one read-only GitHub API request, throttled
+  gh-tollbooth sweep QUERIES.tsv [--first N]    many repo searches, a few per GraphQL request
 
 `call` takes `gh api`'s form: one endpoint (or graphql) with -X GET|HEAD, -f/-F key=value,
 -H 'Accept: ...', -i and --silent. It prints GitHub's answer as it is: pipe it to jq to pick fields.
+
+`sweep` reads one `slice<TAB>query` per line and prints one JSON row per repository found (stars,
+language, topics, ..., plus the slice and query), 5 queries per request at the default --first 20.
 
 Global options (before or after the command, before `--`): --as LABEL  --budget N
 --budget caps the GitHub calls LABEL makes in 24 h. It is cooperative: it holds while every command
 passes it, and can't stop an agent that drops it, picks another label or calls GitHub another way.
 Exit codes: 0 ok; 1 no token, no answer from GitHub, an HTTP error answer or no state folder;
-2 usage or a request gh-tollbooth refuses; 3 GitHub gave up on the request; 4 budget used up;
+2 usage or a request gh-tollbooth refuses; 3 GitHub gave up on all or part of a request; 4 budget used up;
 75 GitHub rate limit (stop and report the time); 76 busy or out of time (retry once later).
 
 Trust boundary: an agent may choose the arguments, never the environment. Python runs in isolated
@@ -41,6 +45,7 @@ import tollbooth_http as http  # noqa: E402
 from tollbooth_core import EX_FAIL, EX_USAGE, TollboothError, clock_in, eprint  # noqa: E402
 from tollbooth_guard import CallRequest, parse_call  # noqa: E402
 from tollbooth_loop import Caller, StoppedOnAnswer  # noqa: E402
+from tollbooth_sweep import read_queries, sweep  # noqa: E402
 from tollbooth_throttle import Throttle  # noqa: E402
 
 BUCKETS = ("graphql", "core", "search", "code_search")
@@ -105,6 +110,15 @@ def cmd_call(caller: Caller, a: argparse.Namespace) -> int:
     return EX_FAIL
 
 
+def cmd_sweep(caller: Caller, a: argparse.Namespace) -> int:
+    """Many repository searches; one JSON row per repository on stdout, progress on stderr."""
+    queries = read_queries(a.queries)  # a refused file costs nothing
+    if sys.stdout is None:  # `>&-`: every row would be lost
+        raise TollboothError("stdout is closed, so the rows would be lost: redirect it to a file", EX_USAGE)
+    sweep(caller, queries, a.first, sys.stdout)
+    return 0
+
+
 def write_answer(resp: http.Response, req: CallRequest) -> None:
     """The answer on stdout: with -i the status line and headers first; with --silent nothing."""
     if req.silent:
@@ -146,6 +160,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="one read-only GitHub API request: call -- api <args>")
     s.add_argument("--no-cache", action="store_true", help="accepted and ignored: gh-tollbooth doesn't cache")
     s.add_argument("gh_args", nargs=argparse.REMAINDER, help="api ENDPOINT [options], as for `gh api`")
+    s = sub.add_parser("sweep", parents=[common], allow_abbrev=False, help="batched GraphQL repo search")
+    s.add_argument("queries", help="a .tsv file: one slice<TAB>query per line")
+    s.add_argument("--first", type=int, default=20, help="results per query, 1 to 100 (default 20)")
+    s.add_argument("--no-cache", action="store_true", help="accepted and ignored: gh-tollbooth doesn't cache")
     return p
 
 
@@ -179,7 +197,7 @@ def main(argv=None) -> int:
                "set TOLLBOOTH_STATE_DIR to a folder you can write to")
         return EX_FAIL
     caller = Caller(label, budget, throttle)
-    handler = {"status": cmd_status, "call": cmd_call}[a.cmd]
+    handler = {"status": cmd_status, "call": cmd_call, "sweep": cmd_sweep}[a.cmd]
     try:
         code = handler(caller, a)
         if sys.stdout is not None:  # None when stdout was closed (`>&-`)

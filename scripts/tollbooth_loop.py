@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 import tollbooth_core as core
+import tollbooth_graphql as graphql
 import tollbooth_http as http
 import tollbooth_throttle
 from tollbooth_core import EX_HEAVY, Clock, TollboothError, eprint, limited
@@ -102,7 +103,7 @@ class Caller:
         token = self.token()
         http.build_request(method, path, token, accept, json_body)  # a request it would refuse fails here
         req = _Request(method, path, token, accept, json_body, core.infer_bucket(path),
-                       _summary(method, path, json_body))
+                       graphql.summary(method, path, json_body))
         throttle, clock = self.throttle, self.throttle.clock
         deadline = clock.mono() + core.DEADLINE
         backoff, answers = _Backoff(), 0
@@ -142,18 +143,9 @@ def _send(req: _Request, clock: Clock, backoff: _Backoff, left: float) -> Tuple[
     return _Answer(resp, verdict, what, delay), resp.status, {b: delay for b in limited_buckets}
 
 
-# ---------- helpers ----------
-
-def _summary(method: str, path: str, json_body: Optional[dict]) -> str:
-    """What was asked, for the call log: the method, the path and a GraphQL document's text."""
-    query = json_body.get("query") if isinstance(json_body, dict) else None
-    return f"{method} {path} {query}" if isinstance(query, str) else f"{method} {path}"
-
-
 def _gave_up(method: str, path: str) -> TollboothError:
     """A 502 or 504: GitHub stopped working on the request. Only a GraphQL query can be made lighter."""
     if path == "graphql":
-        return TollboothError("GitHub gave up on the query (502/504: its 10 s limit). Make it lighter: "
-                              "fewer aliases, a smaller first:, fewer nested connections.", EX_HEAVY)
+        return TollboothError(graphql.HEAVY_QUERY_ADVICE, EX_HEAVY)
     return TollboothError(f"GitHub timed out on {method} {path[:60]} (502/504). Try again later, or ask for less.",
                           EX_HEAVY)

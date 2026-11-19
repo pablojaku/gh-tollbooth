@@ -217,7 +217,7 @@ class NoAnswer(LoopbackCase):
     def test_the_timeout_is_a_positive_number_of_at_most_an_hour(self):
         for bad in (float("nan"), float("inf"), 0, -1, None, "5", True, 3601, 1e10):
             with self.assertRaises(ValueError, msg=repr(bad)):
-                http.send("GET", "repos/o/r", TOKEN, timeout=bad)
+                http.send("GET", "repos/o/r", TOKEN, timeout=cast(float, bad))  # wrong types on purpose
         self.assertEqual(self.server.seen, [])
 
     def test_an_oversized_body(self):
@@ -365,6 +365,7 @@ class Classify(unittest.TestCase):
         self.assertEqual((v.kind, v.delay), ("secondary", None))
         v = http.classify(primary(now + 100, resource="search"), now)
         self.assertEqual((v.kind, v.bucket), ("primary", "search"))
+        assert v.delay is not None
         self.assertAlmostEqual(v.delay, 102, delta=0.01)
         self.assertEqual(http.classify(primary(now - 100), now).delay, 1.0)  # reset in the past: tiny, not negative
         self.assertIsNone(http.classify(answer(403, ok_headers), now).kind)  # a permission error
@@ -378,6 +379,7 @@ class Classify(unittest.TestCase):
         failed = answer(200, spent, b'{"errors": [{"type": "RATE_LIMITED"}]}')
         v = http.classify(failed, now, "graphql")
         self.assertEqual((v.kind, v.bucket), ("primary", "graphql"))
+        assert v.delay is not None
         self.assertAlmostEqual(v.delay, 22, delta=0.01)
         self.assertIsNone(http.classify(failed, now, "repos/o/r").kind)  # only a GraphQL answer means that
         self.assertIsNone(http.classify(failed, now).kind)

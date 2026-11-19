@@ -220,7 +220,7 @@ for _ in range(40):
                                       stderr=subprocess.PIPE, text=True) for _ in range(6)]
             errors = [p.communicate()[1][-300:] for p in procs]
             self.assertEqual([p.returncode for p in procs], [0] * 6, errors)
-            t = throttling.Throttle(d)
+            t = throttling.Throttle(Path(d))
             self.assertEqual((t.used("lab"), len(t.entries())), (480, 240))
             self.assertEqual([f.name for f in Path(d).iterdir() if f.name.endswith(".tmp")], [])
 
@@ -247,7 +247,7 @@ for i in range(50):
                                       stderr=subprocess.PIPE, text=True) for _ in range(6)]
             errors = [p.communicate()[1][-300:] for p in procs]
             self.assertEqual([p.returncode for p in procs], [0] * 6, errors)
-            self.assertEqual(len(throttling.Throttle(d).entries()), 300)
+            self.assertEqual(len(throttling.Throttle(Path(d)).entries()), 300)
 
 
 if __name__ == "__main__":

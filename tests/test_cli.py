@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Union
 from unittest import mock
 
 from _fixtures import SCRIPTS, TOKEN, answer, http, load_cli, logged, primary, recorded
@@ -62,7 +63,7 @@ class CliCase(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def main(self, argv, send=None, token=TOKEN):
+    def main(self, argv, send=None, token: Union[str, Exception] = TOKEN):
         """Run the CLI with a fake token and a fake GitHub. Returns (exit code, stdout, stderr)."""
         send = send if send is not None else answer(200, body=RATE_LIMIT)
         out, err = io.StringIO(), io.StringIO()
@@ -316,6 +317,60 @@ class Call(CliCase):
 
     def test_status_works_with_a_spent_budget(self):
         self.assertEqual(self.main(["--as", "lab", "--budget", "0", "status"])[0], 0)
+
+
+class Sweep(CliCase):
+    """`sweep QUERIES.tsv`: rows on stdout, progress on stderr, the exit code says whether they're complete."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(core, "SPACING", {k: 0 for k in core.SPACING})  # the real clock runs here
+        p.start()
+        self.addCleanup(p.stop)
+        self.queries = Path(self.tmp.name) / "q.tsv"
+        self.queries.write_text("A\tone\nB\ttwo\n")
+
+    @staticmethod
+    def found(q1=None):
+        data = {"q0": {"repositoryCount": 1, "nodes": [{"nameWithOwner": "o/one", "stargazerCount": 3}]},
+                "q1": q1 if q1 is not None else {"repositoryCount": 1, "nodes": [{"nameWithOwner": "o/two"}]},
+                "rateLimit": {"cost": 1, "remaining": 4999}}
+        return answer(200, body=json.dumps({"data": data}).encode())
+
+    def test_rows_on_stdout_and_progress_on_stderr(self):
+        code, out, err = self.main(["--as", "lab", "sweep", str(self.queries), "--no-cache"], send=self.found())
+        rows = [json.loads(ln) for ln in out.splitlines()]
+        self.assertEqual((code, [(r["slice"], r["nameWithOwner"]) for r in rows]),
+                         (0, [("A", "o/one"), ("B", "o/two")]))
+        self.assertIn("PASS: 2 queries, 2 rows", err)
+        self.assertEqual(self.send.call_count, 1)
+        self.assertEqual(throttling.Throttle(self.state).used("lab"), 1)
+
+    def test_an_incomplete_answer_exits_3_with_the_rows_it_got(self):
+        code, out, err = self.main(["sweep", str(self.queries)], send=self.found(q1={"nodes": [None]}))
+        self.assertEqual((code, len(out.splitlines())), (core.EX_HEAVY, 1))
+        self.assertIn("slices: B", err)
+
+    def test_a_refused_file_or_option_exits_2_and_costs_nothing(self):
+        bad = Path(self.tmp.name) / "bad.tsv"
+        bad.write_text("A\tx\x00y\n")
+        for argv in (["sweep", str(bad)], ["sweep", str(Path(self.tmp.name) / "missing.tsv")],
+                     ["sweep", str(self.queries), "--first", "0"], ["sweep", str(self.queries), "--fir", "5"]):
+            try:
+                code, out, _ = self.main(["--as", "lab"] + argv, send=self.found())
+            except SystemExit as e:  # argparse refuses an abbreviated option
+                code, out = e.code, ""
+            self.assertEqual((code, out), (core.EX_USAGE, ""), argv)
+        self.assertEqual(throttling.Throttle(self.state).used("lab"), 0)
+
+    def test_a_closed_stdout_is_refused_before_anything_is_sent(self):
+        err = io.StringIO()
+        with mock.patch.object(http, "send", fake(self.found())) as send, \
+                mock.patch.object(http, "token", fake(TOKEN)), \
+                contextlib.redirect_stdout(None), contextlib.redirect_stderr(err):  # like `>&-`
+            code = cli.main(["sweep", str(self.queries)])
+        self.assertEqual((code, send.call_count), (core.EX_USAGE, 0))
+        self.assertIn("stdout is closed", err.getvalue())
 
 
 class StateFolder(CliCase):
