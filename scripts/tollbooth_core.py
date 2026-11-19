@@ -4,13 +4,16 @@ Settings are TOLLBOOTH_* environment variables, read by pydantic-settings. A bad
 one line on stderr and the default is used: a typo in one agent's environment must not stop its calls.
 The clock seam: a Clock gives the wall clock (times shared between processes), the monotonic clock (a
 call's own deadline) and sleep; SystemClock in production, a fake in the tests.
+read_regular_file() reads a file an agent names (a query file, rows to rank) only if it is a small regular file.
 Not here: the lock and the shared state (tollbooth_throttle), talking to GitHub (tollbooth_http) and
 the command line (tollbooth_cli).
 """
 from __future__ import annotations
 
 import logging
+import os
 import re
+import stat
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -49,6 +52,39 @@ class TollboothError(Exception):
     def __init__(self, msg: str, code: int):
         super().__init__(msg)
         self.code = code
+
+
+# ---------- files an agent names ----------
+
+def read_regular_file(path: str | Path, what: str, max_bytes: int) -> bytes:
+    """The bytes of a regular, non-symlink file of at most `max_bytes`, for a file an agent names.
+
+    The open file is checked, so the path can't be swapped between the check and the read, and opening a
+    FIFO can't hang. Errors name `what` and the path, never the file's text (exit 2).
+    """
+    if os.path.islink(path):
+        raise TollboothError(f"{what} {path}: symlinks are not accepted", EX_USAGE)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as e:
+        raise TollboothError(f"can't open {what} {path}: {e.strerror}", EX_USAGE) from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise TollboothError(f"{what} {path} is not a regular file", EX_USAGE)
+        if st.st_size > max_bytes:
+            raise TollboothError(f"{what} {path} is larger than {max_bytes // 1024} KB", EX_USAGE)
+        with os.fdopen(fd, "rb") as f:  # takes the fd over
+            fd = -1
+            data = f.read(max_bytes + 1)
+    except OSError as e:
+        raise TollboothError(f"can't read {what} {path}: {e.strerror}", EX_USAGE) from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(data) > max_bytes:  # it grew after fstat
+        raise TollboothError(f"{what} {path} is larger than {max_bytes // 1024} KB", EX_USAGE)
+    return data
 
 
 # ---------- the clock seam ----------
