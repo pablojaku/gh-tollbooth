@@ -20,6 +20,7 @@ import click
 from graphql import FragmentDefinitionNode, GraphQLError, OperationDefinitionNode, parse
 
 from tollbooth_core import EX_USAGE, TollboothError
+from tollbooth_text import has_hidden, is_utf8
 
 # All patterns are used with fullmatch (Python's `$` would let a trailing newline through).
 # An endpoint starts with a letter, digit or `_`, so it can never be read as an option. No `{owner}`
@@ -31,14 +32,6 @@ ACCEPT_HEADER_RE = re.compile(r"accept\s*:(.*)", re.I | re.S)
 ACCEPT_VALUE_RE = re.compile(r"[ -~]{1,200}")  # printable ASCII: a line break would start another header
 INT_RE = re.compile(r"[+-]?[0-9]{1,19}")
 INT64 = 2 ** 63
-# Control chars (except tab and newline), CR (a GraphQL line terminator), NEL, zero-width and
-# bidi-control characters, Unicode line/paragraph separators and the BOM. Built from code points
-# so the source file itself contains no invisible characters.
-_BAD_CODEPOINTS = [*range(0x00, 0x09), *range(0x0B, 0x20), 0x7F, 0x85, *range(0x200B, 0x2010),
-                   0x2028, 0x2029, *range(0x202A, 0x202F), *range(0x2066, 0x206A), 0xFEFF]
-BAD_CHARS_RE = re.compile("[" + re.escape("".join(map(chr, _BAD_CODEPOINTS))) + "]")
-# Lone surrogates: how Python decodes argv bytes that aren't UTF-8 (U+DC80-U+DCFF); no request can carry them.
-NOT_UTF8_RE = re.compile("[\ud800-\udfff]")
 
 JQ_HINT = ("{opt} is gone: call prints GitHub's JSON as it is, so pipe the output to jq instead, "
            "e.g. gh-tollbooth call -- api graphql -f query='...' | jq '.data'")
@@ -206,9 +199,9 @@ def parse_call(args: list[str]) -> CallRequest:
     if not args:
         _refuse("no request given (use: gh-tollbooth call -- api <endpoint> ...)")
     for a in args:
-        if NOT_UTF8_RE.search(a):
+        if not is_utf8(a):
             _refuse(f"arguments must be valid UTF-8 text (in {a[:40]!r})")
-        if BAD_CHARS_RE.search(a):
+        if has_hidden(a):
             _refuse(f"control or invisible characters are not allowed in gh-tollbooth arguments (in {a[:40]!r})")
     if args[0] != "api":
         _refuse(f"call makes GitHub API requests only, not `gh {args[0][:20]}`. Use the API form, "

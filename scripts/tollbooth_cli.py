@@ -12,7 +12,6 @@ from __future__ import annotations
 import datetime as dt
 import io
 import os
-import re
 import sys
 from collections import Counter
 from contextlib import suppress
@@ -30,10 +29,9 @@ import tollbooth_http as http  # noqa: E402
 import tollbooth_throttle  # noqa: E402
 from tollbooth_guard import CallRequest, parse_call  # noqa: E402
 from tollbooth_loop import Caller  # noqa: E402
+from tollbooth_text import LABEL_RE, printable  # noqa: E402
 
-LABEL_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # always use .fullmatch: "$" would accept a trailing newline
 MAX_RESET = 10 ** 11  # seconds; a reset time later than this is not a real Unix time
-CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # never printed from a header: it could drive the terminal
 
 
 # ---------- GitHub's rate_limit answer ----------
@@ -230,7 +228,7 @@ def _write_answer(resp: http.Response, req: CallRequest) -> None:
     if req.include:
         head = [f"HTTP/1.1 {resp.status} {REASONS.get(resp.status, '')}".rstrip()]
         head += [f"{_header_name(k)}: {v}" for k, v in resp.headers.items()]
-        out.write("".join(CONTROL_RE.sub("?", line) + "\n" for line in head).encode("utf-8", "replace") + b"\n")
+        out.write("".join(printable(line) + "\n" for line in head).encode("utf-8", "replace") + b"\n")
     out.write(resp.body)
     out.flush()
 

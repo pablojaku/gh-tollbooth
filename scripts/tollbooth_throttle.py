@@ -27,6 +27,7 @@ from tenacity import retry, retry_if_exception, stop_after_attempt
 
 import tollbooth_core as core
 from tollbooth_core import EX_BUDGET, EX_BUSY, EX_FAIL, EX_LIMITED, TollboothError, log
+from tollbooth_text import printable
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -50,7 +51,6 @@ BUDGET_WINDOW_HOURS = 24   # a budget counts the charges of this hour and the 24
 STATE_WAIT = 10            # seconds to wait for another agent's change to state.db (each is one short transaction)
 LOG_KEEP = 5000            # calls kept in the call log; older ones are deleted
 LOG_SUMMARY = 160          # characters kept of what each call asked
-CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # The tables of state.db, made on first use. STRICT: SQLite refuses a value of the wrong type, so readers
 # don't have to check what they get back.
@@ -121,11 +121,6 @@ def _limited(what: str, seconds: float, clock: core.Clock) -> TollboothError:
 def _budget_error(label: str, budget: int) -> TollboothError:
     return TollboothError(f"the budget of {budget} GitHub calls for '{label}' is used up. "
                           "Stop querying and report what you have.", EX_BUDGET)
-
-
-def _printable(text: str) -> str:
-    """`text` with control characters as "?", so nothing in the log can drive a terminal."""
-    return CONTROL_RE.sub("?", text)
 
 
 def _vanished(e: BaseException) -> bool:
@@ -421,7 +416,7 @@ class Throttle:
 
     def _log(self, label: str, bucket: str, status: int, secs: float, summary: str) -> None:
         """Add one call to the log and keep the newest LOG_KEEP. A call that can't be logged is dropped."""
-        summary = _printable(re.sub(r"\s+", " ", summary))[:LOG_SUMMARY]
+        summary = printable(re.sub(r"\s+", " ", summary))[:LOG_SUMMARY]
 
         def record(con: sqlite3.Connection) -> None:
             con.execute("INSERT INTO call (at, label, pid, bucket, status, secs, summary) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -436,5 +431,5 @@ class Throttle:
         """Calls logged at or after `since` (wall-clock time), oldest first, control characters as "?"."""
         rows = self._db(lambda con: con.execute("SELECT at, label, pid, bucket, status, secs, summary FROM call "
                                                 "WHERE at >= ? ORDER BY id", (since,)).fetchall(), write=False)
-        return [Call(at, _printable(label), pid, _printable(bucket), status, secs, _printable(summary))
+        return [Call(at, printable(label), pid, printable(bucket), status, secs, printable(summary))
                 for at, label, pid, bucket, status, secs, summary in rows]
