@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "One machine-wide, throttled, read-only request stream to GitHub for AI agents"
 requires-python = ">=3.11"
 dependencies = [
+    "filelock>=4.3.1",
     "httpx>=0.28.1",
     "pydantic>=2.14.4",
     "pydantic-settings>=2.16.3",
+    "tenacity>=9.2.1",
 ]
 
 [dependency-groups]
