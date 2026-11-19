@@ -26,6 +26,7 @@ from pydantic import BaseModel, BeforeValidator, Field, ValidationError  # noqa:
 
 import tollbooth_core as core  # noqa: E402
 import tollbooth_http as http  # noqa: E402
+import tollbooth_sweep  # noqa: E402
 import tollbooth_throttle  # noqa: E402
 from tollbooth_guard import CallRequest, parse_call  # noqa: E402
 from tollbooth_loop import Caller  # noqa: E402
@@ -145,7 +146,7 @@ def cli(ctx: click.Context, label: str | None, budget: int | None) -> None:
 
     \b
     Exit codes: 0 ok; 1 no token, no answer from GitHub, an HTTP error answer, no state folder or a bug;
-    2 usage or a request gh-tollbooth refuses; 3 GitHub gave up on the request; 4 budget used up;
+    2 usage or a request gh-tollbooth refuses; 3 GitHub gave up on all or part of a request; 4 budget used up;
     75 GitHub rate limit (stop and report the time); 76 busy or out of time (retry once later).
     """
     ctx.obj = {"label": label, "budget": budget}
@@ -205,6 +206,30 @@ def call(ctx: click.Context, label: str | None, budget: int | None, no_cache: bo
     _write_answer(resp, req)
     if not 200 <= resp.status < 300:
         _fail(ctx, f"HTTP {resp.status} {REASONS.get(resp.status, '')}".rstrip(), core.EX_FAIL)
+
+
+@cli.command()
+@_global_options
+@click.option("--first", type=click.IntRange(1, tollbooth_sweep.NODE_BUDGET), default=20, show_default=True,
+              metavar="N", help="Results per query, 1 to 100.")
+@click.option("--no-cache", is_flag=True, help="Accepted and ignored: gh-tollbooth doesn't cache.")
+@click.argument("queries_file", metavar="QUERIES.tsv")
+@click.pass_context
+def sweep(ctx: click.Context, label: str | None, budget: int | None, first: int, no_cache: bool,
+          queries_file: str) -> None:
+    """Many repository searches, a few per GraphQL request: one JSON row per repository on stdout.
+
+    \b
+    QUERIES.tsv has one slice<TAB>query per line; # comments and blank lines are skipped. The slice names
+    the part of the topic a query covers and goes into every row the query finds. sort:stars-desc is
+    added to a query that names no sort. Progress goes to stderr. Exit 3 means some queries came back
+    incomplete; the rows printed are still good.
+    """
+    caller = _start(ctx, label, budget)
+    queries = tollbooth_sweep.read_queries(queries_file)  # a refused file costs nothing
+    if sys.stdout is None:  # `>&-`: every row would be lost
+        raise core.TollboothError("stdout is closed, so the rows would be lost: redirect it to a file", core.EX_USAGE)
+    tollbooth_sweep.sweep(caller, queries, first, sys.stdout)
 
 
 def _write_answer(resp: http.Response, req: CallRequest) -> None:

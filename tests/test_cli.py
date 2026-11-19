@@ -320,6 +320,60 @@ class Call(CliCase):
         self.assertEqual(self.main(["--as", "lab", "--budget", "0", "status"])[0], 0)
 
 
+class Sweep(CliCase):
+    """`sweep QUERIES.tsv`: rows on stdout, progress on stderr, the exit code says whether they're complete."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.dict(throttling.SPACING, {k: 0 for k in throttling.SPACING})  # the real clock runs here
+        p.start()
+        self.addCleanup(p.stop)
+        self.queries = Path(self.tmp.name) / "q.tsv"
+        self.queries.write_text("A\tone\nB\ttwo\n")
+
+    @staticmethod
+    def found(q1=None):
+        data = {"q0": {"repositoryCount": 1, "nodes": [{"nameWithOwner": "o/one", "stargazerCount": 3}]},
+                "q1": q1 if q1 is not None else {"repositoryCount": 1, "nodes": [{"nameWithOwner": "o/two"}]},
+                "rateLimit": {"cost": 1, "remaining": 4999}}
+        return answer(200, body=json.dumps({"data": data}).encode())
+
+    def test_rows_on_stdout_and_progress_on_stderr(self):
+        with self.assertLogs("gh-tollbooth", "INFO") as notices:
+            code, out, _ = self.main(["--as", "lab", "sweep", str(self.queries), "--no-cache"], send=self.found())
+        rows = [json.loads(ln) for ln in out.splitlines()]
+        self.assertEqual((code, [(r["slice"], r["nameWithOwner"]) for r in rows]),
+                         (0, [("A", "o/one"), ("B", "o/two")]))
+        self.assertIn("PASS: 2 queries, 2 rows", "\n".join(notices.output))
+        self.assertEqual(self.send.call_count, 1)
+        self.assertEqual(throttling.Throttle(self.state).used("lab"), 1)
+
+    def test_an_incomplete_answer_exits_3_with_the_rows_it_got(self):
+        code, out, err = self.main(["sweep", str(self.queries)], send=self.found(q1={"nodes": [None]}))
+        self.assertEqual((code, len(out.splitlines())), (core.EX_HEAVY, 1))
+        self.assertIn("slices: B", err)
+
+    def test_a_refused_file_or_option_exits_2_and_costs_nothing(self):
+        bad = Path(self.tmp.name) / "bad.tsv"
+        bad.write_text("A\tx\x00y\n")
+        for argv in (["sweep", str(bad)], ["sweep", str(Path(self.tmp.name) / "missing.tsv")],
+                     ["sweep", str(self.queries), "--first", "0"], ["sweep", str(self.queries), "--first", "101"],
+                     ["sweep", str(self.queries), "--fir", "5"], ["sweep"]):
+            code, out, _ = self.main(["--as", "lab"] + argv, send=self.found())
+            self.assertEqual((code, out), (core.EX_USAGE, ""), argv)
+        self.send.assert_not_called()
+        self.assertEqual(throttling.Throttle(self.state).used("lab"), 0)
+
+    def test_a_closed_stdout_is_refused_before_anything_is_sent(self):
+        err = io.StringIO()
+        with mock.patch.object(http, "send", fake(self.found())) as send, \
+                mock.patch.object(http, "token", fake(TOKEN)), \
+                contextlib.redirect_stdout(None), contextlib.redirect_stderr(err):  # like `>&-`
+            code = cli.main(["sweep", str(self.queries)])
+        self.assertEqual((code, send.call_count), (core.EX_USAGE, 0))
+        self.assertIn("stdout is closed", err.getvalue())
+
+
 class StateFolder(CliCase):
     def test_a_folder_that_cannot_be_created_is_one_line_not_a_traceback(self):
         a_file = Path(self.tmp.name) / "file"
