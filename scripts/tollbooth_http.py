@@ -12,8 +12,10 @@ rest of what can't be trusted to be whole: a body that only the closing connecti
 over MAX_BODY_BYTES.
 
 classify() decides about rate limits from the status code and GitHub's rate-limit headers, never
-from error text, which can echo a query. The one body field it reads is a 403's
-`documentation_url`, which GitHub sets: a secondary limit can arrive without those headers.
+from error text, which can echo a query. It looks at the body in two narrow cases: a 403's
+`documentation_url`, which GitHub sets (a secondary limit can arrive without those headers), and,
+for a GraphQL 200 with nothing left, whether it has errors and no data (how GitHub reports a spent
+GraphQL limit), never what the errors say.
 
 The token (GH_TOKEN, GITHUB_TOKEN or `gh auth token`) goes in the Authorization header only.
 """
@@ -215,6 +217,14 @@ class _ErrorBody(BaseModel):
     documentation_url: str | None = None
 
 
+class _GraphQLBody(BaseModel):
+    """What classify() reads of a GraphQL answer: whether it has errors, and whether it has data."""
+
+    model_config = ConfigDict(strict=True)  # `errors` must be a list
+    errors: list[Any] | None = None
+    data: Any = None  # missing and null both read as None
+
+
 def _int(value) -> int | None:
     """A whole number from a header, or None for anything else (a number too big to be a time, too)."""
     try:
@@ -239,27 +249,41 @@ def _links_secondary_limit_docs(body: bytes) -> bool:
     return url is not None and SECONDARY_DOC_RE.fullmatch(url) is not None
 
 
-def classify(resp: Response, wall_now: float, failed: bool = False) -> Verdict:
-    """Decide from the HTTP status and GitHub's headers, plus one GitHub-set field of a 403's body.
+def _graphql_spent(path: str, resp: Response) -> bool:
+    """True for a GraphQL 200 with errors, no data and no requests left: GitHub's spent GraphQL limit.
 
-    `failed` says a 200 answer carried GraphQL errors (GitHub reports a spent GraphQL limit that way).
+    Data next to an error (a NOT_FOUND among the results) is an answer, not a spent limit.
+    """
+    if path != "graphql" or resp.status != 200 or resp.headers.get("x-ratelimit-remaining") != "0":
+        return False
+    try:
+        doc = _GraphQLBody.model_validate_json(resp.body)
+    except ValidationError:
+        return False
+    return bool(doc.errors) and doc.data is None
+
+
+def classify(resp: Response, wall_now: float, path: str = "") -> Verdict:
+    """Decide from the HTTP status and GitHub's headers, plus two narrow looks at the body.
+
+    `path` is the request's path: GitHub reports a GraphQL limit with status 200.
 
     - 502/504                                         -> heavy
-    - 403/429 with Retry-After                        -> secondary, wait Retry-After
-    - 403/429, or a failed 200, with X-RateLimit-Remaining 0 -> primary until the reset time
+    - 403/429, or a GraphQL 200, with Retry-After      -> secondary, wait Retry-After
+    - 403/429, or a spent GraphQL 200, with X-RateLimit-Remaining 0 -> primary until the reset time
     - 429 without those headers                       -> secondary (the caller picks the backoff)
     - 403 without them whose documentation_url is the secondary-limit page -> secondary (same)
-    - anything else (permission 403, 404, GraphQL NOT_FOUND, ...) -> None: not a rate limit
+    - anything else (permission 403, 404, GraphQL data with a NOT_FOUND error, ...) -> None: not a limit
     """
     h = resp.headers
     bucket = h.get("x-ratelimit-resource")
     if resp.status in (502, 504):
         return Verdict("heavy")
-    if not (resp.status in (403, 429) or (resp.status == 200 and failed)):
-        return Verdict()
     retry = _int(h.get("retry-after"))
-    if retry is not None and resp.status in (403, 429):
+    if retry is not None and (resp.status in (403, 429) or (path == "graphql" and resp.status == 200)):
         return Verdict("secondary", float(max(1, retry)), bucket)
+    if not (resp.status in (403, 429) or _graphql_spent(path, resp)):
+        return Verdict()
     reset = _int(h.get("x-ratelimit-reset"))
     if h.get("x-ratelimit-remaining") == "0" and reset is not None:
         return Verdict("primary", max(1.0, reset + 2 - wall_now), bucket)
