@@ -83,13 +83,7 @@ def _start(ctx: click.Context, label: str | None, budget: int | None) -> Caller:
         raise click.UsageError("--as LABEL may use only letters, digits, '.', '_' and '-' (max 40)")
     if limit is not None and who == "anon":
         raise click.UsageError("--budget needs a unique --as LABEL (calls are counted per label)")
-    folder = core.SETTINGS.state_dir
-    try:
-        throttle = tollbooth_throttle.Throttle(folder)
-    except OSError as e:
-        raise core.TollboothError(f"can't create the state folder {folder} ({e.strerror or e}); "
-                                  "set TOLLBOOTH_STATE_DIR to a folder you can write to", core.EX_FAIL) from None
-    return Caller(who, limit, throttle)
+    return Caller(who, limit, tollbooth_throttle.Throttle(core.SETTINGS.state_dir))
 
 
 def _reader_left() -> None:

@@ -333,6 +333,18 @@ class StateFolder(CliCase):
             self.send.assert_not_called()
 
 
+    @unittest.skipIf(os.geteuid() == 0, "root can open a file without permission")
+    def test_a_lock_file_only_root_can_open_is_one_line_not_a_traceback(self):
+        self.state.mkdir()
+        (self.state / "lock").write_text("")
+        (self.state / "lock").chmod(0)
+        self.addCleanup((self.state / "lock").chmod, 0o644)
+        code, out, err = self.main(["call", "--", "api", "repos/o/r"])
+        self.assertEqual((code, out, len(err.splitlines())), (core.EX_FAIL, "", 1), err)
+        self.assertIn("TOLLBOOTH_STATE_DIR", err)
+        self.send.assert_not_called()
+
+
 class NeverATraceback(unittest.TestCase):
     """Real processes: these failures happen outside what a test can hand to the command."""
 

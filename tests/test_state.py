@@ -156,6 +156,16 @@ class StateFile(StateCase):
         self.throttle._mark("core", {"core": self.clock.now() + 30})
         self.assertAlmostEqual(self.throttle.blocked_for("core"), 30, delta=0.01)
 
+    @unittest.skipIf(os.geteuid() == 0, "root can open a file without permission")
+    def test_a_file_that_is_not_a_database_and_cannot_be_moved_is_exit_1(self):
+        self.throttle.db_path.write_bytes(b"not a database " * 100)
+        self.dir.chmod(0o555)  # the folder can't take state.db.broken
+        self.addCleanup(self.dir.chmod, 0o755)
+        with self.assertLogs("gh-tollbooth", "WARNING"), self.assertRaises(core.TollboothError) as cm:
+            self.throttle.blocked_for("core")
+        self.assertEqual(cm.exception.code, core.EX_FAIL)
+        self.assertIn("TOLLBOOTH_STATE_DIR", str(cm.exception))
+
     def test_a_busy_file_is_exit_76(self):
         holder = sqlite3.connect(self.throttle.db_path, isolation_level=None)
         self.addCleanup(holder.close)
@@ -163,6 +173,40 @@ class StateFile(StateCase):
         with mock.patch.object(throttling, "STATE_WAIT", 0.1), self.assertRaises(core.TollboothError) as cm:
             self.throttle._charge("lab")
         self.assertEqual(cm.exception.code, core.EX_BUSY)
+
+
+class FolderUnusable(StateCase):
+    """The state folder or a file in it can't be used: exit 1, with what to do, never a traceback."""
+
+    def assertExit1(self, cm, path):
+        self.assertEqual(cm.exception.code, core.EX_FAIL)
+        self.assertIn(str(path), str(cm.exception))
+        self.assertIn("TOLLBOOTH_STATE_DIR", str(cm.exception))
+
+    def test_a_folder_that_cannot_be_made(self):
+        a_file = self.dir / "file"
+        a_file.write_text("")
+        for folder in (a_file, a_file / "state"):  # the path is a file; a parent of the path is a file
+            with self.assertRaises(core.TollboothError) as cm:
+                throttling.Throttle(folder, self.clock)
+            self.assertExit1(cm, folder)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can open a file without permission")
+    def test_a_lock_file_that_cannot_be_opened(self):
+        # one `sudo gh-tollbooth call` leaves a lock file only root can open
+        self.throttle.lock_path.write_text("")
+        self.throttle.lock_path.chmod(0)
+        self.addCleanup(self.throttle.lock_path.chmod, 0o644)
+        with self.assertRaises(core.TollboothError) as cm, self.throttle.hold(self.clock.mono() + 5):
+            pass
+        self.assertExit1(cm, self.throttle.lock_path)
+
+    def test_a_folder_that_turns_into_a_file(self):
+        self.throttle.dir.rmdir()
+        self.throttle.dir.write_text("")  # mkdir fails with "exists" on every try
+        with self.assertRaises(core.TollboothError) as cm:
+            self.throttle.blocked_for("core")
+        self.assertExit1(cm, self.throttle.dir)
 
 
 class FolderVanishes(StateCase):

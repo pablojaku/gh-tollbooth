@@ -123,6 +123,12 @@ def _budget_error(label: str, budget: int) -> TollboothError:
                           "Stop querying and report what you have.", EX_BUDGET)
 
 
+def _unusable(path: Path, e: BaseException) -> TollboothError:
+    """Exit 1: the state folder or a file in it can't be used (permissions, a file in the way, ...)."""
+    return TollboothError(f"can't use {path} ({getattr(e, 'strerror', None) or e}); fix its permissions or set "
+                          "TOLLBOOTH_STATE_DIR to a folder you can write to", EX_FAIL)
+
+
 def _vanished(e: BaseException) -> bool:
     if isinstance(e, sqlite3.OperationalError):  # SQLite can't open, read or write a file whose folder was deleted
         code = getattr(e, "sqlite_errorcode", 0)
@@ -188,13 +194,16 @@ class Throttle:
     """The machine-wide lock, the shared state and the turn every request takes through them.
 
     Times come from `clock`: its wall clock for what is shared between processes, its monotonic clock
-    for a call's own deadline.
+    for a call's own deadline. A state folder, lock or state.db that can't be used is exit 1.
     """
 
     def __init__(self, state_dir: Path | None = None, clock: core.Clock = core.SYSTEM_CLOCK):
         self.dir = core.SETTINGS.state_dir if state_dir is None else Path(state_dir)
         self.clock = clock
-        self.dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise _unusable(self.dir, e) from None
         self.lock_path = self.dir / "lock"
         self.db_path = self.dir / "state.db"
 
@@ -226,6 +235,8 @@ class Throttle:
                 wait_until(deadline)
         except Timeout:
             raise _busy("another agent held the GitHub lock too long") from None
+        except OSError as e:  # after Timeout, which is an OSError too
+            raise _unusable(self.lock_path, e) from None
         try:
             yield self
         finally:
@@ -320,7 +331,8 @@ class Throttle:
 
         A write starts with BEGIN IMMEDIATE, SQLite's write lock, so what it reads and what it writes are
         one step for every agent; another agent waits up to STATE_WAIT seconds, then gets exit 76. A deleted
-        folder is made again (_in_folder). A file that isn't a database is moved to state.db.broken.
+        folder is made again (_in_folder). A file that isn't a database is moved to state.db.broken. Any
+        other error is exit 1.
         """
         def once() -> T:
             con = sqlite3.connect(self.db_path, timeout=STATE_WAIT, isolation_level=None)
@@ -336,15 +348,21 @@ class Throttle:
         try:
             return _in_folder(self.dir, once)
         except sqlite3.DatabaseError as e:
-            code = getattr(e, "sqlite_errorcode", 0) & 0xFF
-            if code == sqlite3.SQLITE_BUSY:
-                raise _busy("another agent held the state file too long") from None
-            if code not in (sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CORRUPT):
-                raise TollboothError(f"can't use {self.db_path} ({e}); fix its permissions or set "
-                                     "TOLLBOOTH_STATE_DIR to a folder you own", EX_FAIL) from None
+            if (getattr(e, "sqlite_errorcode", 0) & 0xFF) not in (sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CORRUPT):
+                raise self._db_error(e) from None
+        except OSError as e:
+            raise _unusable(self.dir, e) from None
         log.warning("%s is not a SQLite database; moved it to state.db.broken and started a new one", self.db_path)
-        self.db_path.replace(self.db_path.with_name("state.db.broken"))
-        return _in_folder(self.dir, once)
+        try:
+            self.db_path.replace(self.db_path.with_name("state.db.broken"))
+            return _in_folder(self.dir, once)
+        except (sqlite3.DatabaseError, OSError) as e:
+            raise self._db_error(e) from None
+
+    def _db_error(self, e: sqlite3.DatabaseError | OSError) -> TollboothError:
+        if isinstance(e, sqlite3.DatabaseError) and (getattr(e, "sqlite_errorcode", 0) & 0xFF) == sqlite3.SQLITE_BUSY:
+            return _busy("another agent held the state file too long")
+        return _unusable(self.db_path, e)
 
     def blocked_for(self, bucket: str) -> float:
         """Seconds until a recorded block on `bucket` ends (0 or less if none). Blocks over an hour ahead are stale."""
