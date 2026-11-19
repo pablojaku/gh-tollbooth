@@ -96,7 +96,7 @@ class Caller:
         except http.TransportError as e:
             raise _no_answer(e) from None
         if resp.status != 200:
-            hint = " (GitHub rejected the token: run `gh auth login`, or check GH_TOKEN)" if resp.status == 401 else ""
+            hint = http.TOKEN_REJECTED_HINT if resp.status == 401 else ""
             raise TollboothError(f"GET rate_limit answered HTTP {resp.status}{hint}", EX_FAIL)
         return resp.body
 

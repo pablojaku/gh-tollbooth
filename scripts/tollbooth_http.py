@@ -58,6 +58,9 @@ GH_ENV_PIN = {"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"}
 GH_TOKEN_TIMEOUT = 15
 
 
+TOKEN_REJECTED_HINT = " (GitHub rejected the token: run `gh auth login`, or check GH_TOKEN)"  # after a 401
+
+
 class NoToken(Exception):
     """There is no usable GitHub token. The message says how to get one and never holds a token."""
 
