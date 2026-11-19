@@ -68,8 +68,8 @@ class Spacing(StateCase):
 class Blocks(StateCase):
     def test_a_block_is_seen_by_every_agent(self):
         self.assertEqual(self.throttle.blocked_for("core"), 0.0)
-        self.throttle._mark("graphql", {b: self.clock.now() + 30 for b in throttling.SPACING})
-        for b in throttling.SPACING:
+        self.throttle._mark("graphql", {b: self.clock.now() + 30 for b in throttling.BUCKETS})
+        for b in throttling.BUCKETS:
             self.assertAlmostEqual(self.other_agent().blocked_for(b), 30, delta=0.01)
         self.clock.sleep(31)
         self.assertLessEqual(self.throttle.blocked_for("core"), 0)

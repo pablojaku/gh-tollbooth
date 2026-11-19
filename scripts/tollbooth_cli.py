@@ -31,7 +31,6 @@ import tollbooth_throttle  # noqa: E402
 from tollbooth_guard import CallRequest, parse_call  # noqa: E402
 from tollbooth_loop import Caller  # noqa: E402
 
-BUCKETS = ("graphql", "core", "search", "code_search")
 LABEL_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # always use .fullmatch: "$" would accept a trailing newline
 MAX_RESET = 10 ** 11  # seconds; a reset time later than this is not a real Unix time
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # never printed from a header: it could drive the terminal
@@ -61,7 +60,8 @@ class _Resources(BaseModel):
 
 
 class _RateLimit(BaseModel):
-    """The part of GitHub's GET rate_limit answer that `status` shows. Other buckets are ignored."""
+    """The part of GitHub's GET rate_limit answer that `status` shows: the tracked buckets (tollbooth_throttle.BUCKETS,
+    in that order). Other buckets are ignored."""
 
     resources: _Resources
 
@@ -177,7 +177,7 @@ def status(ctx: click.Context, label: str | None, budget: int | None, last: int)
         raise core.TollboothError("GET rate_limit: the answer is not GitHub's rate-limit document",
                                   core.EX_FAIL) from None
     click.echo("bucket        remaining/limit  resets")
-    for name in BUCKETS:
+    for name in tollbooth_throttle.BUCKETS:
         b: _Bucket = getattr(resources, name)
         left = caller.throttle.blocked_for(name)
         blocked = f"  BLOCKED until {_clock(caller.throttle.clock.now() + left)}" if left > 0 else ""

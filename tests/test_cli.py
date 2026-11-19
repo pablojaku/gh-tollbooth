@@ -31,25 +31,6 @@ RATE_LIMIT = json.dumps({"resources": {
     "dependency_sbom": {"limit": 100, "remaining": 100, "reset": RESET}}}).encode()
 
 
-class InferBucket(unittest.TestCase):
-    def test_buckets(self):
-        cases = {
-            "graphql": "graphql",
-            "search/code?q=x": "code_search",
-            "search/repositories?q=x": "search",
-            "search/issues": "search",
-            "repos/a/b": "core",
-            "/repos/a/b": "core",
-            "rate_limit": "core",
-            "": "core",
-            "SEARCH/repositories?q=x": "search",  # GitHub routes paths case-insensitively
-            "Search/Code": "code_search",
-            "GraphQL": "graphql",
-        }
-        for path, want in cases.items():
-            self.assertEqual(core.infer_bucket(path), want, path)
-
-
 def fake(value):
     """A mock that raises `value` if it is an exception, and returns it otherwise."""
     return mock.Mock(side_effect=value) if isinstance(value, Exception) else mock.Mock(return_value=value)
@@ -97,6 +78,9 @@ class Status(CliCase):
         rows = {ln.split()[0]: ln.split()[1] for ln in out.splitlines()[1:5]}
         self.assertEqual(rows, {"graphql": "4321/5000", "core": "4990/5000", "search": "0/30", "code_search": "10/10"})
         self.assertNotIn("dependency_sbom", out)
+
+    def test_reads_exactly_the_tracked_buckets(self):
+        self.assertEqual(tuple(cli._Resources.model_fields), throttling.BUCKETS)
 
     def test_is_one_free_request_outside_the_throttle(self):
         self.main(["--as", "lab", "status"])

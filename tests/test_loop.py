@@ -107,7 +107,7 @@ class Limits(LoopCase):
         seen = []
 
         def sleep_and_look(seconds):
-            seen.append([round(throttling.Throttle(self.dir, self.clock).blocked_for(b)) for b in throttling.SPACING])
+            seen.append([round(throttling.Throttle(self.dir, self.clock).blocked_for(b)) for b in throttling.BUCKETS])
             sleep(seconds)
         with mock.patch.object(self.clock, "sleep", sleep_and_look):
             self.assertIs(self.fetch(), OK)

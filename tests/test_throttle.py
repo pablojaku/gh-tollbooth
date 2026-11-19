@@ -71,6 +71,28 @@ class Settings(unittest.TestCase):
                                    "(not a whole number of seconds); using 100\n")
 
 
+class InferBucket(unittest.TestCase):
+    """Which of the tracked buckets a request goes to."""
+
+    def test_buckets(self):
+        cases = {
+            "graphql": "graphql",
+            "search/code?q=x": "code_search",
+            "search/repositories?q=x": "search",
+            "search/issues": "search",
+            "repos/a/b": "core",
+            "/repos/a/b": "core",
+            "rate_limit": "core",
+            "": "core",
+            "SEARCH/repositories?q=x": "search",  # GitHub routes paths case-insensitively
+            "Search/Code": "code_search",
+            "GraphQL": "graphql",
+        }
+        for path, want in cases.items():
+            self.assertEqual(throttling.infer_bucket(path), want, path)
+        self.assertEqual(set(cases.values()), set(throttling.BUCKETS))  # every bucket, and only those
+
+
 class LockCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

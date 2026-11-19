@@ -18,7 +18,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-import tollbooth_core as core
 import tollbooth_http as http
 import tollbooth_throttle as throttling
 from tollbooth_core import EX_HEAVY, TollboothError
@@ -58,7 +57,7 @@ class Caller:
         deadline = throttling.Deadline(clock)  # first: the time `gh auth token` takes counts too
         token = self.token()
         http.build_request(method, path, token, accept, json_body)  # a request it would refuse costs nothing
-        bucket = core.infer_bucket(path)
+        bucket = throttling.infer_bucket(path)
 
         def send(left: float) -> tuple[http.Response, int, throttling.Limit | None]:
             resp = http.send(method, path, token, accept=accept, json_body=json_body,
@@ -80,9 +79,9 @@ def _limit(verdict: http.Verdict, bucket: str) -> throttling.Limit | None:
     """
     if verdict.kind == "primary":
         named = verdict.bucket or bucket
-        return throttling.Limit(named, (named,) if named in throttling.SPACING else (), verdict.delay)
+        return throttling.Limit(named, (named,) if named in throttling.BUCKETS else (), verdict.delay)
     if verdict.kind == "secondary":
-        return throttling.Limit("every bucket", tuple(throttling.SPACING), verdict.delay)
+        return throttling.Limit("every bucket", throttling.BUCKETS, verdict.delay)
     return None
 
 

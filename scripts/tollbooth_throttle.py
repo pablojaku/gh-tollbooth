@@ -3,6 +3,7 @@
 The machine-wide lock is a filelock FileLock (flock on Unix) on `lock` in the shared state folder.
 The shared state (call times, blocks, budget charges and the call log) is one SQLite file there, state.db.
 A Deadline is one call's time budget: every wait asks it first, and it picks exit 75 or 76.
+BUCKETS are the rate-limit buckets the throttle tracks; infer_bucket() says which one a request goes to.
 A command takes one turn per request with Throttle.turn(): check the budget and blocks, wait without
 the lock, then under the lock check again, charge, send and record. Charging, marking and logging are
 private, so no caller can get that order wrong.
@@ -42,6 +43,7 @@ MAX_PASSES = 60            # turns one call takes before it gives up; a safety n
 FIRST_BACKOFF = 60         # seconds to wait after a secondary limit that names none; doubled on each such answer
 MAX_ANSWERS = 4            # rate-limited answers one call takes; the fourth is exit 75
 SPACING = {"graphql": 1.0, "core": 0.5, "search": 2.2, "code_search": 6.5}  # seconds between calls, per bucket
+BUCKETS = tuple(SPACING)   # the buckets the throttle tracks, in the order status shows them; GitHub has more
 BLOCK_CAP = 3600           # seconds; GitHub limits reset hourly, so a longer wait is recorded as one hour...
 BLOCK_STALE = 3700         # ...and a block further ahead than this can't be real (a clock step): it is ignored
 BUDGET_WINDOW_HOURS = 24   # a budget counts the charges of this hour and the 24 before it
@@ -92,6 +94,16 @@ class StoppedOnAnswer(TollboothError):
     def __init__(self, error: TollboothError, answer: Any):
         super().__init__(str(error), error.code)
         self.answer = answer
+
+
+def infer_bucket(path: str) -> str:
+    """GitHub's rate-limit bucket for a relative API path. GitHub routes `SEARCH/x` like `search/x`."""
+    ep = path.lstrip("/").lower()
+    if ep == "graphql":
+        return "graphql"
+    if ep.startswith("search/code"):
+        return "code_search"
+    return "search" if ep.startswith("search/") else "core"
 
 
 def _busy(why: str) -> TollboothError:

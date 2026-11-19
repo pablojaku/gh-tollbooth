@@ -41,16 +41,6 @@ class TollboothError(Exception):
         self.code = code
 
 
-def infer_bucket(path: str) -> str:
-    """GitHub's rate-limit bucket for a relative API path. GitHub routes `SEARCH/x` like `search/x`."""
-    ep = path.lstrip("/").lower()
-    if ep == "graphql":
-        return "graphql"
-    if ep.startswith("search/code"):
-        return "code_search"
-    return "search" if ep.startswith("search/") else "core"
-
-
 # ---------- the clock seam ----------
 
 class Clock(Protocol):

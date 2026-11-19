@@ -229,10 +229,10 @@ class Limits(TurnCase):
         self.assertEqual([c.status for c in self.throttle.entries()], [403, 200])
 
     def test_a_secondary_limit_blocks_every_bucket(self):
-        every = throttling.Limit("every bucket", tuple(throttling.SPACING), 30)
+        every = throttling.Limit("every bucket", throttling.BUCKETS, 30)
         with self.assertRaises(core.TollboothError):
             self.turn(deadline=throttling.Deadline(self.clock, seconds=30), send=self.answers(every))
-        for b in throttling.SPACING:
+        for b in throttling.BUCKETS:
             self.assertAlmostEqual(self.other_agent().blocked_for(b), 30, delta=0.01)
 
     def test_a_wait_longer_than_max_wait_is_exit_75_and_the_block_stays_for_every_agent(self):
@@ -256,7 +256,7 @@ class Limits(TurnCase):
         self.assertEqual((len(self.sent), self.other_agent().blocked_for("core")), (1, 0.0))
 
     def test_the_backoff_doubles_across_calls_and_agents_until_an_answer_is_not_limited(self):
-        unnamed = throttling.Limit("every bucket", tuple(throttling.SPACING), None)
+        unnamed = throttling.Limit("every bucket", throttling.BUCKETS, None)
         with self.assertRaises(core.TollboothError):  # waits 60 s, then 120 s is over TOLLBOOTH_MAX_WAIT
             self.turn(send=self.answers(unnamed, unnamed))
         self.assertEqual(self.clock.sleeps, [60])
