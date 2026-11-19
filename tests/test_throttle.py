@@ -56,6 +56,14 @@ class Settings(unittest.TestCase):
             self.assertEqual(self.settings(deadline="999999").deadline, 999_999)
             self.assertEqual(self.settings(deadline="").deadline, 100)
 
+    def test_max_wait_follows_the_same_rule(self):
+        with self.assertNoLogs("gh-tollbooth"):
+            self.assertEqual(self.settings(max_wait="30").max_wait, 30)
+            self.assertEqual(self.settings(max_wait="").max_wait, 60)
+        with self.assertLogs("gh-tollbooth", "WARNING") as logs:
+            self.assertEqual(self.settings(max_wait="soon").max_wait, 60)
+        self.assertIn("TOLLBOOTH_MAX_WAIT", logs.output[0])
+
     def test_the_line_on_stderr(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("TOLLBOOTH_")}
         env.update(TOLLBOOTH_DEADLINE="soon", PYTHONPATH=str(Path(core.__file__).parent))

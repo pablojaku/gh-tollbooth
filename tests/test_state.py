@@ -1,6 +1,6 @@
 """Shared-state tests: call spacing, rate-limit blocks, budgets and the call log, all in state.db.
 
-Mock-first: FakeClock replaces tollbooth_core.wall_clock, so times are exact and no test waits.
+Mock-first: the Throttle is given a FakeClock, so times are exact and no test waits.
 ManyProcesses runs real processes on the real clock.
 Run: uv run pytest
 """
@@ -25,14 +25,11 @@ class StateCase(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name) / "state"
         self.clock = FakeClock()
-        p = mock.patch.object(throttling, "wall_clock", self.clock.now)
-        p.start()
-        self.addCleanup(p.stop)
-        self.throttle = throttling.Throttle(self.dir)
+        self.throttle = throttling.Throttle(self.dir, self.clock)
 
     def other_agent(self):
         """A second Throttle on the same state folder, as another process would have."""
-        return throttling.Throttle(self.dir)
+        return throttling.Throttle(self.dir, self.clock)
 
     def rows(self, sql: str) -> list:
         """Rows straight from state.db, to see what is stored."""

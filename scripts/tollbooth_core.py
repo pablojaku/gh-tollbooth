@@ -2,6 +2,8 @@
 
 Settings are TOLLBOOTH_* environment variables, read by pydantic-settings. A bad value is ignored with
 one line on stderr and the default is used: a typo in one agent's environment must not stop its calls.
+The clock seam: a Clock gives the wall clock (times shared between processes), the monotonic clock (a
+call's own deadline) and sleep; SystemClock in production, a fake in the tests.
 Not here: the lock and the shared state (tollbooth_throttle), talking to GitHub (tollbooth_http) and
 the command line (tollbooth_cli).
 """
@@ -9,9 +11,10 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Protocol
 
 from pydantic import (AfterValidator, BeforeValidator, Field, ValidationError, ValidationInfo,
                       ValidatorFunctionWrapHandler, WrapValidator)
@@ -26,6 +29,7 @@ if not log.handlers:  # each notice is one "gh-tollbooth: ..." line on stderr
     log.propagate = False
 
 DEFAULT_DEADLINE = 100     # seconds per GitHub call; under the Bash tool's 120 s default
+DEFAULT_MAX_WAIT = 60      # seconds; the longest rate-limit block or backoff one call sleeps through
 # 1 = no token, no answer from GitHub, or no state folder; 75 = GitHub rate limit (stop, report the reset time);
 # 76 = gh-tollbooth busy or out of time (retry once later)
 EX_FAIL, EX_USAGE, EX_HEAVY, EX_BUDGET, EX_LIMITED, EX_BUSY = 1, 2, 3, 4, 75, 76
@@ -45,6 +49,37 @@ def infer_bucket(path: str) -> str:
     if ep.startswith("search/code"):
         return "code_search"
     return "search" if ep.startswith("search/") else "core"
+
+
+# ---------- the clock seam ----------
+
+class Clock(Protocol):
+    """Where gh-tollbooth gets the time. SystemClock in production; tests pass a fake that never sleeps."""
+
+    def now(self) -> float:
+        """Wall clock: the times shared between processes (state.db)."""
+        ...
+
+    def mono(self) -> float:
+        """Monotonic clock: a call's own deadline, so a wall-clock step can't bend it."""
+        ...
+
+    def sleep(self, seconds: float) -> None:
+        ...
+
+
+class SystemClock:
+    def now(self) -> float:
+        return time.time()
+
+    def mono(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(max(0.0, seconds))
+
+
+SYSTEM_CLOCK = SystemClock()
 
 
 # ---------- settings ----------
@@ -88,6 +123,10 @@ class Settings(BaseSettings):
     deadline: Annotated[int, Field(ge=1, le=999_999), BeforeValidator(_whole_seconds),
                         _or_default(lambda: DEFAULT_DEADLINE, "not a whole number of seconds",
                                     str(DEFAULT_DEADLINE), 20)] = DEFAULT_DEADLINE
+    # seconds; the longest rate-limit block or backoff one call sleeps through; 1 to 999,999
+    max_wait: Annotated[int, Field(ge=1, le=999_999), BeforeValidator(_whole_seconds),
+                        _or_default(lambda: DEFAULT_MAX_WAIT, "not a whole number of seconds",
+                                    str(DEFAULT_MAX_WAIT), 20)] = DEFAULT_MAX_WAIT
     # the folder every agent shares; an absolute path, so all agents find the same one
     state_dir: Annotated[Path, AfterValidator(_absolute),
                          _or_default(_default_state_dir, "not an absolute path", "~/.cache/gh-tollbooth", 40)

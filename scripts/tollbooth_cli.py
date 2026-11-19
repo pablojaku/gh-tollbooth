@@ -177,9 +177,9 @@ def status(ctx: click.Context, label: str | None, budget: int | None, last: int)
     for name in BUCKETS:
         b: _Bucket = getattr(resources, name)
         left = run.throttle.blocked_for(name)
-        blocked = f"  BLOCKED until {_clock(tollbooth_throttle.wall_clock() + left)}" if left > 0 else ""
+        blocked = f"  BLOCKED until {_clock(run.throttle.clock.now() + left)}" if left > 0 else ""
         click.echo(f"{name:13} {_shown(b.remaining):>6}/{_shown(b.limit):<6}  {_clock(b.reset)}{blocked}")
-    recent = run.throttle.entries(since=tollbooth_throttle.wall_clock() - 3600)
+    recent = run.throttle.entries(since=run.throttle.clock.now() - 3600)
     click.echo(f"\ngh-tollbooth calls in the last hour: {len(recent)}")
     for (who, bucket), n in Counter((c.label, c.bucket) for c in recent).most_common(15):
         click.echo(f"  {n:4}  {bucket:12} {who}")

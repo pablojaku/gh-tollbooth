@@ -10,7 +10,6 @@ import errno
 import os
 import re
 import sqlite3
-import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -65,11 +64,6 @@ class Call:
     summary: str    # what was asked, cut to LOG_SUMMARY characters, control characters as "?"
 
 
-def wall_clock() -> float:
-    """Wall-clock Unix time: every time shared between processes (state.db) uses it. Tests replace it."""
-    return time.time()
-
-
 def _busy(why: str) -> TollboothError:
     return TollboothError(f"{why}; gave up so this command doesn't hang (TOLLBOOTH_DEADLINE {core.SETTINGS.deadline} s). "
                           "gh-tollbooth is busy, not rate-limited: wait a minute and retry once.", EX_BUSY)
@@ -100,17 +94,22 @@ def _in_folder(folder: Path, step: Callable[[], T]) -> T:
 # ---------- shared throttle ----------
 
 class Throttle:
-    """The machine-wide lock and the shared state, in the shared state folder."""
+    """The machine-wide lock and the shared state, in the shared state folder.
 
-    def __init__(self, state_dir: Path | None = None):
+    Times come from `clock`: its wall clock for what is shared between processes, its monotonic clock
+    for a call's own deadline.
+    """
+
+    def __init__(self, state_dir: Path | None = None, clock: core.Clock = core.SYSTEM_CLOCK):
         self.dir = core.SETTINGS.state_dir if state_dir is None else Path(state_dir)
+        self.clock = clock
         self.dir.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.dir / "lock"
         self.db_path = self.dir / "state.db"
 
     @contextmanager
     def hold(self, deadline: float) -> Generator[Throttle, None, None]:
-        """Hold the machine-wide lock; give up (exit 76) at `deadline`, a time.monotonic() value.
+        """Hold the machine-wide lock; give up (exit 76) at `deadline`, a value of the monotonic clock.
 
         filelock tries every LOCK_POLL seconds and opens the file again on each try, so a waiter follows a
         lock file that was deleted or replaced. One line on stderr says so after WAIT_NOTICE seconds.
@@ -122,10 +121,10 @@ class Throttle:
         lock = FileLock(self.lock_path, thread_local=False)
 
         def wait_until(limit: float) -> None:
-            _in_folder(self.dir, lambda: lock.acquire(timeout=max(0.0, limit - time.monotonic()),
+            _in_folder(self.dir, lambda: lock.acquire(timeout=max(0.0, limit - self.clock.mono()),
                                                       poll_interval=LOCK_POLL))
 
-        notice_at = time.monotonic() + WAIT_NOTICE
+        notice_at = self.clock.mono() + WAIT_NOTICE
         try:
             try:
                 wait_until(min(deadline, notice_at))
@@ -178,14 +177,14 @@ class Throttle:
         """Seconds until a recorded block on `bucket` ends (0 or less if none). Blocks over an hour ahead are stale."""
         row = self._db(lambda con: con.execute("SELECT until FROM block WHERE bucket = ?", (bucket,)).fetchone(),
                        write=False)
-        left = row[0] - wall_clock() if row else 0.0
+        left = row[0] - self.clock.now() if row else 0.0
         return 0.0 if left > BLOCK_STALE else left
 
     def spacing_gap(self, bucket: str) -> float:
         """Seconds to wait before the next call in `bucket` (at most SPACING; a last call in the future waits 0)."""
         row = self._db(lambda con: con.execute("SELECT at FROM last_call WHERE bucket = ?", (bucket,)).fetchone(),
                        write=False)
-        elapsed = wall_clock() - row[0] if row else SPACING[bucket]
+        elapsed = self.clock.now() - row[0] if row else SPACING[bucket]
         return SPACING[bucket] - elapsed if 0 <= elapsed < SPACING[bucket] else 0.0
 
     def mark(self, bucket: str, blocks: dict[str, float] | None = None, spaced: bool = True) -> None:
@@ -195,7 +194,7 @@ class Throttle:
         one is stale (more than BLOCK_STALE ahead).
         """
         def record(con: sqlite3.Connection) -> None:
-            now = wall_clock()
+            now = self.clock.now()
             if spaced:
                 con.execute("INSERT INTO last_call VALUES (?, ?) ON CONFLICT (bucket) DO UPDATE SET at = excluded.at",
                             (bucket, now))
@@ -209,7 +208,7 @@ class Throttle:
 
     def charge(self, label: str) -> int:
         """Charge one call to `label` in this hour and return the hour (for refund). Old charges are deleted."""
-        hour = int(wall_clock() // 3600)
+        hour = int(self.clock.now() // 3600)
 
         def record(con: sqlite3.Connection) -> None:
             con.execute("DELETE FROM charge WHERE hour NOT BETWEEN ? AND ?", (hour - BUDGET_WINDOW_HOURS, hour + 1))
@@ -225,7 +224,7 @@ class Throttle:
 
     def used(self, label: str) -> int:
         """Calls charged to `label` in this hour and the 24 before it (the hour after counts too: a clock step)."""
-        hour = int(wall_clock() // 3600)
+        hour = int(self.clock.now() // 3600)
         sql = "SELECT coalesce(sum(n), 0) FROM charge WHERE label = ? AND hour BETWEEN ? AND ?"
         row = self._db(lambda con: con.execute(sql, (label, hour - BUDGET_WINDOW_HOURS, hour + 1)).fetchone(),
                        write=False)
@@ -239,7 +238,7 @@ class Throttle:
 
         def record(con: sqlite3.Connection) -> None:
             con.execute("INSERT INTO call (at, label, pid, bucket, status, secs, summary) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (wall_clock(), label, os.getpid(), bucket, status, secs, summary))
+                        (self.clock.now(), label, os.getpid(), bucket, status, secs, summary))
             con.execute("DELETE FROM call WHERE id <= (SELECT max(id) FROM call) - ?", (LOG_KEEP,))
         try:
             self._db(record)
