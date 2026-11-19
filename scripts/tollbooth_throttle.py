@@ -39,6 +39,8 @@ WAIT_NOTICE = 5            # seconds of waiting for the lock before one "waiting
 MIN_CALL_TIME = 15         # seconds; no request starts with less time left (or half the deadline, if shorter)
 SPACING_UNDER_LOCK = 2.5   # seconds; a longer call gap (code search) is slept without the lock
 MAX_PASSES = 60            # turns one call takes before it gives up; a safety net, waits end it sooner
+FIRST_BACKOFF = 60         # seconds to wait after a secondary limit that names none; doubled on each such answer
+MAX_ANSWERS = 4            # rate-limited answers one call takes; the fourth is exit 75
 SPACING = {"graphql": 1.0, "core": 0.5, "search": 2.2, "code_search": 6.5}  # seconds between calls, per bucket
 BLOCK_CAP = 3600           # seconds; GitHub limits reset hourly, so a longer wait is recorded as one hour...
 BLOCK_STALE = 3700         # ...and a block further ahead than this can't be real (a clock step): it is ignored
@@ -58,6 +60,7 @@ CREATE TABLE IF NOT EXISTS charge (label TEXT NOT NULL, hour INTEGER NOT NULL, n
 CREATE TABLE IF NOT EXISTS call (id INTEGER PRIMARY KEY, at REAL NOT NULL, label TEXT NOT NULL, pid INTEGER NOT NULL,
                                  bucket TEXT NOT NULL, status INTEGER NOT NULL, secs REAL NOT NULL,
                                  summary TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS backoff (id INTEGER PRIMARY KEY CHECK (id = 1), seconds REAL NOT NULL) STRICT;
 """
 
 
@@ -71,6 +74,14 @@ class Call:
     status: int     # HTTP status, 0 if GitHub gave no answer
     secs: float
     summary: str    # what was asked, cut to LOG_SUMMARY characters, control characters as "?"
+
+
+@dataclass(frozen=True)
+class Limit:
+    """A rate limit GitHub reported for one request, as send() hands it to Throttle.turn()."""
+    what: str                 # for messages: a bucket, "every bucket", or an untracked resource
+    buckets: tuple[str, ...]  # the buckets every agent must stop for; empty: only this call stops
+    seconds: float | None     # how long GitHub said to wait; None: it didn't say, so the shared backoff decides
 
 
 def _busy(why: str) -> TollboothError:
@@ -206,22 +217,33 @@ class Throttle:
     # ---- one turn ----
 
     def turn(self, label: str, budget: int | None, bucket: str, deadline: Deadline, summary: str,
-             send: Callable[[float], tuple[R, int]]) -> R:
-        """One request through the shared throttle; returns what `send` returned first.
+             send: Callable[[float], tuple[R, int, Limit | None]]) -> R:
+        """One request through the shared throttle; returns what `send` returned with no rate limit.
 
         1. Check: the label's budget (exit 4) and a block on the bucket longer than TOLLBOOTH_MAX_WAIT (75).
         2. Without the lock: wait out a short block, then the bucket's call gap; the Deadline decides.
         3. Under the lock: check again, charge the label, call send(seconds_left), record the call.
         If another agent blocked or used the bucket while we waited for the lock, go round again.
-        `send` returns (result, HTTP status). A request is charged before it is sent, so a killed
-        process pays; if `send` raises, the call is still spaced and logged, with status 0.
+        `send` returns (result, HTTP status, Limit or None). A Limit is recorded as a block for every
+        agent; the turn then waits it out and sends again, up to MAX_ANSWERS limited answers. A limit
+        on a resource the throttle doesn't track is not shared, and ends this call (exit 75).
+        A request is charged before it is sent, so a killed process pays; if `send` raises, the call
+        is still spaced and logged, with status 0.
         """
+        answers = 0
         for _ in range(MAX_PASSES):
             self._check(label, budget, bucket)
             self._wait_turn(bucket, deadline)
             got = self._attempt(label, budget, bucket, deadline, summary, send)
-            if got is not None:
-                return got[0]
+            if got is None:
+                continue
+            result, limit, seconds = got
+            if limit is None:
+                return result
+            answers += 1
+            if not limit.buckets or answers >= MAX_ANSWERS:
+                raise _limited(limit.what, seconds, self.clock)
+            deadline.wait(seconds, limit=limit.what)
         raise _busy("still not our turn after repeated waits")
 
     def _check(self, label: str, budget: int | None, bucket: str) -> None:
@@ -238,8 +260,9 @@ class Throttle:
         deadline.wait(self.spacing_gap(bucket))
 
     def _attempt(self, label: str, budget: int | None, bucket: str, deadline: Deadline, summary: str,
-                 send: Callable[[float], tuple[R, int]]) -> tuple[R] | None:
-        """Under the lock: check again, charge, send, record. None means another agent got in first."""
+                 send: Callable[[float], tuple[R, int, Limit | None]]) -> tuple[R, Limit | None, float] | None:
+        """Under the lock: check again, charge, send, record. Returns send's result, its Limit and the
+        seconds to wait for it; None means another agent got in first."""
         with self.hold(deadline.at):
             if self.blocked_for(bucket) > 0:  # another agent recorded a block while we waited for the lock
                 return None
@@ -252,14 +275,20 @@ class Throttle:
             self._charge(label)
             started = self.clock.mono()
             try:
-                result, status = send(deadline.left())
+                result, status, limit = send(deadline.left())
             except Exception:
                 self._mark(bucket)
                 self._log(label, bucket, 0, self.clock.mono() - started, summary)
                 raise
-            self._mark(bucket)
+            seconds = 0.0
+            if limit is None:
+                self._mark(bucket, reset_backoff=True)
+            else:
+                seconds = min(self._next_backoff() if limit.seconds is None else limit.seconds, BLOCK_CAP)
+                now = self.clock.now()
+                self._mark(bucket, {b: now + seconds for b in limit.buckets})
             self._log(label, bucket, status, self.clock.mono() - started, summary)
-            return (result,)
+            return result, limit, seconds
 
     # ---- state.db: one short transaction per step, safe with or without hold() ----
 
@@ -308,14 +337,18 @@ class Throttle:
         elapsed = self.clock.now() - row[0] if row else SPACING[bucket]
         return SPACING[bucket] - elapsed if 0 <= elapsed < SPACING[bucket] else 0.0
 
-    def _mark(self, bucket: str, blocks: dict[str, float] | None = None, spaced: bool = True) -> None:
+    def _mark(self, bucket: str, blocks: dict[str, float] | None = None, spaced: bool = True,
+              reset_backoff: bool = False) -> None:
         """Record a call's time (for spacing) and blocks {bucket: until} that every agent must honor.
 
         A block is cut to BLOCK_CAP from now. A shorter block never shortens a longer one, unless the stored
-        one is stale (more than BLOCK_STALE ahead).
+        one is stale (more than BLOCK_STALE ahead). `reset_backoff`: GitHub answered without a limit, so
+        the next wait for a secondary limit that names none starts at FIRST_BACKOFF again.
         """
         def record(con: sqlite3.Connection) -> None:
             now = self.clock.now()
+            if reset_backoff:
+                con.execute("DELETE FROM backoff")
             if spaced:
                 con.execute("INSERT INTO last_call VALUES (?, ?) ON CONFLICT (bucket) DO UPDATE SET at = excluded.at",
                             (bucket, now))
@@ -324,6 +357,17 @@ class Throttle:
                             "CASE WHEN until - :now > :stale THEN excluded.until ELSE max(until, excluded.until) END",
                             {"b": b, "until": min(until, now + BLOCK_CAP), "now": now, "stale": BLOCK_STALE})
         self._db(record)
+
+    def _next_backoff(self) -> float:
+        """The wait for a secondary limit that names none: FIRST_BACKOFF, doubled on each such answer to any
+        agent until one that isn't a limit. It lives in state.db, so it keeps growing across calls."""
+        def bump(con: sqlite3.Connection) -> float:
+            row = con.execute("SELECT seconds FROM backoff").fetchone()
+            seconds = row[0] if row else float(FIRST_BACKOFF)
+            con.execute("INSERT INTO backoff VALUES (1, :s) ON CONFLICT (id) DO UPDATE SET seconds = :s",
+                        {"s": min(seconds * 2, BLOCK_CAP)})
+            return seconds
+        return self._db(bump)
 
     # ---- budgets: per label and wall-clock hour, charged before the call starts ----
 

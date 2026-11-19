@@ -91,7 +91,7 @@ class TurnCase(ClockCase):
 
     def send(self, left):
         self.sent.append(round(left, 3))
-        return "answer", 200
+        return "answer", 200, None
 
     def turn(self, bucket="core", budget=None, deadline=None, send=None):
         deadline = deadline or throttling.Deadline(self.clock)
@@ -113,7 +113,7 @@ class Turn(TurnCase):
 
         def send(left):
             held.append(not self.lock_is_free())
-            return "answer", 200
+            return "answer", 200, None
         self.assertEqual(self.turn(send=send), "answer")
         self.assertEqual(held, [True])
         self.assertTrue(self.lock_is_free())
@@ -200,6 +200,75 @@ class AnotherRound(TurnCase):
         with mock.patch.object(self.throttle, "hold", hold_after_another_agents_code_search):
             self.turn(bucket="code_search")
         self.assertEqual((self.clock.sleeps, len(self.sent)), ([throttling.SPACING["code_search"]], 1))
+
+
+class Limits(TurnCase):
+    """What a rate-limited answer does: blocks every agent, waits, sends again, or ends the call."""
+
+    def answers(self, *limits):
+        """A send that answers with each Limit in turn (None: not limited), then with no limit."""
+        queue = list(limits)
+
+        def send(left):
+            self.sent.append(round(left, 3))
+            limit = queue.pop(0) if queue else None
+            return "answer", 403 if limit else 200, limit
+        return send
+
+    def test_a_primary_limit_blocks_its_bucket_for_every_agent_then_sends_again(self):
+        seen = []
+        sleep = self.clock.sleep
+
+        def sleep_and_look(seconds):
+            seen.append(round(self.other_agent().blocked_for("search"), 3))
+            sleep(seconds)
+        with mock.patch.object(self.clock, "sleep", sleep_and_look), self.assertLogs("gh-tollbooth", "INFO"):
+            self.assertEqual(self.turn("search", send=self.answers(throttling.Limit("search", ("search",), 20))),
+                             "answer")
+        self.assertEqual((seen[0], self.clock.sleeps[0], len(self.sent)), (20, 20, 2))
+        self.assertEqual([c.status for c in self.throttle.entries()], [403, 200])
+
+    def test_a_secondary_limit_blocks_every_bucket(self):
+        every = throttling.Limit("every bucket", tuple(throttling.SPACING), 30)
+        with self.assertRaises(core.TollboothError):
+            self.turn(deadline=throttling.Deadline(self.clock, seconds=30), send=self.answers(every))
+        for b in throttling.SPACING:
+            self.assertAlmostEqual(self.other_agent().blocked_for(b), 30, delta=0.01)
+
+    def test_a_wait_longer_than_max_wait_is_exit_75_and_the_block_stays_for_every_agent(self):
+        with self.assertRaises(core.TollboothError) as cm:
+            self.turn(send=self.answers(throttling.Limit("core", ("core",), 3000)))
+        self.assertEqual((cm.exception.code, len(self.sent)), (core.EX_LIMITED, 1))
+        self.assertAlmostEqual(self.other_agent().blocked_for("core"), 3000, delta=0.01)
+
+    def test_the_fourth_limited_answer_is_exit_75(self):
+        one = throttling.Limit("core", ("core",), 1)
+        with self.assertRaises(core.TollboothError) as cm:
+            self.turn(send=self.answers(one, one, one, one))
+        self.assertEqual((cm.exception.code, len(self.sent)), (core.EX_LIMITED, 4))
+
+    def test_a_limit_on_a_resource_the_throttle_does_not_track_is_not_shared(self):
+        with self.assertRaises(core.TollboothError) as cm:
+            self.turn(send=self.answers(throttling.Limit("dependency_sbom", (), 30)))
+        self.assertEqual(cm.exception.code, core.EX_LIMITED)
+        self.assertIn("dependency_sbom is rate-limited", str(cm.exception))
+        self.assertEqual((len(self.sent), self.other_agent().blocked_for("core")), (1, 0.0))
+
+    def test_the_backoff_doubles_across_calls_and_agents_until_an_answer_is_not_limited(self):
+        unnamed = throttling.Limit("every bucket", tuple(throttling.SPACING), None)
+        with self.assertRaises(core.TollboothError):  # waits 60 s, then 120 s is over TOLLBOOTH_MAX_WAIT
+            self.turn(send=self.answers(unnamed, unnamed))
+        self.assertEqual(self.clock.sleeps, [60])
+        self.clock.sleep(200)
+        with self.assertRaises(core.TollboothError):  # another agent's call: 240 s, at once
+            self.other_agent().turn("lab", None, "core", throttling.Deadline(self.clock), "GET y",
+                                    self.answers(unnamed))
+        self.assertAlmostEqual(self.other_agent().blocked_for("core"), 240, delta=0.01)
+        self.clock.sleep(241)
+        self.turn()  # GitHub answers: the backoff starts over
+        with self.assertRaises(core.TollboothError):
+            self.turn(deadline=throttling.Deadline(self.clock, seconds=30), send=self.answers(unnamed))
+        self.assertAlmostEqual(self.other_agent().blocked_for("core"), 60, delta=0.01)
 
 
 if __name__ == "__main__":
