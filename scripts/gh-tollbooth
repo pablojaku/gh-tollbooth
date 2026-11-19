@@ -1,0 +1,144 @@
+#!/usr/bin/env -S python3 -I
+"""gh-tollbooth: one polite, shared, read-only request stream to GitHub for every agent on a machine.
+
+Talks to the GitHub API directly, with the login `gh` already has (or GH_TOKEN). Stdlib only,
+Python 3.9+. Results go to stdout; progress goes to stderr.
+
+  gh-tollbooth status                           rate-limit buckets + recent calls (free)
+
+Global options (before or after the command): --as LABEL  --budget N
+Exit codes: 0 ok, 1 no token, no answer from GitHub or no state folder, 2 usage.
+
+Trust boundary: an agent may choose the arguments, never the environment. Python runs in isolated
+mode (-I), so PYTHONPATH can't put code into this process. The environment still picks the python3
+(PATH), the token (GH_TOKEN) and a proxy that sees the token (HTTPS_PROXY with SSL_CERT_FILE), so
+don't let agents put variable assignments in front of this command.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import io
+import json
+import os
+import sys
+from contextlib import suppress
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tollbooth_core as core  # noqa: E402
+import tollbooth_http as http  # noqa: E402
+from tollbooth_core import EX_FAIL, EX_USAGE, TollboothError, Throttle, clock_in, eprint  # noqa: E402
+
+BUCKETS = ("graphql", "core", "search", "code_search")
+
+
+def _count(value) -> str:
+    """A number from GitHub's answer as text; anything else is "?" (text could carry terminal codes)."""
+    return str(value) if isinstance(value, int) and not isinstance(value, bool) else "?"
+
+
+def cmd_status(ctx, a) -> int:
+    # Asked directly, not through the throttle: GitHub doesn't count rate_limit against any bucket.
+    resp = http.send("GET", "rate_limit", http.token(), timeout=30)
+    if resp.status != 200:
+        hint = " (GitHub rejected the token: run `gh auth login`, or check GH_TOKEN)" if resp.status == 401 else ""
+        raise TollboothError(f"GET rate_limit answered HTTP {resp.status}{hint}", EX_FAIL)
+    try:
+        res = json.loads(resp.body)["resources"]
+        rows = [(b, res.get(b) or {}) for b in BUCKETS]
+        lines = []
+        for b, r in rows:
+            reset = dt.datetime.fromtimestamp(r.get("reset", 0)).strftime("%H:%M:%S")
+            lines.append(f"{b:13} {_count(r.get('remaining')):>6}/{_count(r.get('limit')):<6}  {reset}")
+    except (ValueError, KeyError, TypeError, AttributeError, OverflowError, OSError, RecursionError):
+        raise TollboothError("GET rate_limit: the answer is not GitHub's rate-limit document", EX_FAIL)
+    print("bucket        remaining/limit  resets")
+    for (b, _), line in zip(rows, lines):
+        left = ctx.throttle.blocked_for(b)
+        print(line + (f"  BLOCKED until {clock_in(left)}" if left > 0 else ""))
+    hour_ago = (dt.datetime.now() - dt.timedelta(hours=1)).isoformat(timespec="seconds")
+    recent = [e for e in ctx.throttle.entries() if len(e) >= 7 and e[0] >= hour_ago]
+    counts: dict = {}
+    for e in recent:
+        counts[(e[1], e[3])] = counts.get((e[1], e[3]), 0) + 1
+    print(f"\ngh-tollbooth calls in the last hour: {len(recent)}")
+    for (label, bucket), n in sorted(counts.items(), key=lambda kv: -kv[1])[:15]:
+        print(f"  {n:4}  {bucket:12} {label}")
+    for e in recent[-a.last:] if a.last else []:
+        print(f"  {e[0][11:]}  {e[1]:<16} {e[3]:<12} http={e[4]:<3} {e[5]:>5}s  {e[6][:70]}")
+    return 0
+
+
+def count(text: str) -> int:
+    n = int(text)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return n
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--as", dest="label", default=argparse.SUPPRESS, help="tag calls in the log")
+    common.add_argument("--budget", type=int, default=argparse.SUPPRESS, help="max GitHub calls for --as LABEL")
+    p = argparse.ArgumentParser(prog="gh-tollbooth", parents=[common], description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("status", parents=[common], help="buckets + recent calls (free)")
+    s.add_argument("--last", type=count, default=8, help="recent calls to list (default 8)")
+    return p
+
+
+def _reader_left() -> int:
+    """The reader closed the pipe (`| head`). Not an error: stdout goes nowhere, so the flush at exit is quiet."""
+    with suppress(OSError, ValueError):
+        fd = sys.stdout.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, fd)
+        os.close(devnull)
+    return 0
+
+
+def main(argv=None) -> int:
+    for stream in (sys.stdout, sys.stderr):  # text this locale can't encode (a logged query) prints as '?'
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(errors="replace")
+    a = build_parser().parse_args(argv)
+    label = getattr(a, "label", None) or os.environ.get("TOLLBOOTH_AS", "anon")
+    budget = getattr(a, "budget", None)
+    if not core.LABEL_RE.fullmatch(label):
+        eprint("gh-tollbooth: --as LABEL may use only letters, digits, '.', '_' and '-' (max 40)")
+        return EX_USAGE
+    if budget is not None and label == "anon":
+        eprint("gh-tollbooth: --budget needs a unique --as LABEL (calls are counted per label)")
+        return EX_USAGE
+    try:
+        throttle = Throttle(core.STATE_DIR)
+    except OSError as e:
+        eprint(f"gh-tollbooth: can't create the state folder {core.STATE_DIR} ({e.strerror or e}); "
+               "set TOLLBOOTH_STATE_DIR to a folder you can write to")
+        return EX_FAIL
+    ctx = SimpleNamespace(label=label, budget=budget, throttle=throttle)
+    handler = {"status": cmd_status}[a.cmd]
+    try:
+        code = handler(ctx, a)
+        sys.stdout.flush()  # a closed pipe shows here when the output was small
+        return code
+    except BrokenPipeError:
+        return _reader_left()
+    except TollboothError as e:
+        eprint(f"gh-tollbooth: {e}")
+        return e.code
+    except http.NoToken as e:
+        eprint(f"gh-tollbooth: {e}")
+        return EX_FAIL
+    except http.TransportError as e:
+        eprint(f"gh-tollbooth: no answer from GitHub ({e})")
+        return EX_FAIL
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
