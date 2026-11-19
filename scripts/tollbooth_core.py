@@ -40,7 +40,7 @@ if not log.handlers:  # each notice is one "gh-tollbooth: ..." line on stderr
 
 DEFAULT_DEADLINE = 100     # seconds per GitHub call; under the Bash tool's 120 s default
 DEFAULT_MAX_WAIT = 60      # seconds; the longest rate-limit block or backoff one call sleeps through
-# 1 = no token, no answer from GitHub, or no state folder; 75 = GitHub rate limit (stop, report the reset time);
+# 1 = no token, no answer from GitHub, no state folder or a bug; 75 = GitHub rate limit (stop, report the reset time);
 # 76 = gh-tollbooth busy or out of time (retry once later)
 EX_FAIL, EX_USAGE, EX_HEAVY, EX_BUDGET, EX_LIMITED, EX_BUSY = 1, 2, 3, 4, 75, 76
 

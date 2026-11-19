@@ -101,7 +101,8 @@ def _fail(ctx: click.Context, message: str, code: int) -> NoReturn:
 
 
 class _Guarded(click.Group):
-    """Every failure is one line on stderr and an exit code, never a traceback."""
+    """Every failure is one line on stderr and an exit code, never a traceback; a bug too ("internal error",
+    exit 1). The Caller turns every failure of a request into a TollboothError."""
 
     def invoke(self, ctx: click.Context):
         try:
@@ -114,12 +115,12 @@ class _Guarded(click.Group):
             ctx.exit(0)
         except core.TollboothError as e:
             _fail(ctx, str(e), e.code)
-        except http.NoToken as e:
-            _fail(ctx, str(e), core.EX_FAIL)
-        except http.TransportError as e:
-            _fail(ctx, f"no answer from GitHub ({e})", core.EX_FAIL)
         except KeyboardInterrupt:
             ctx.exit(130)
+        except (click.exceptions.Exit, click.ClickException, click.Abort):
+            raise  # Click's own ways out: ctx.exit() and usage errors
+        except Exception as e:  # a bug
+            _fail(ctx, f"internal error ({type(e).__name__}: {str(e)[:200]}); please report it", core.EX_FAIL)
 
 
 def _global_options(command):
@@ -143,7 +144,7 @@ def cli(ctx: click.Context, label: str | None, budget: int | None) -> None:
     passes it, and can't stop an agent that drops it, picks another label or calls GitHub another way.
 
     \b
-    Exit codes: 0 ok; 1 no token, no answer from GitHub, an HTTP error answer or no state folder;
+    Exit codes: 0 ok; 1 no token, no answer from GitHub, an HTTP error answer, no state folder or a bug;
     2 usage or a request gh-tollbooth refuses; 3 GitHub gave up on the request; 4 budget used up;
     75 GitHub rate limit (stop and report the time); 76 busy or out of time (retry once later).
     """
@@ -157,14 +158,9 @@ def cli(ctx: click.Context, label: str | None, budget: int | None) -> None:
 def status(ctx: click.Context, label: str | None, budget: int | None, last: int) -> None:
     """Rate-limit buckets and recent calls. Free: GitHub doesn't count it."""
     caller = _start(ctx, label, budget)
-    # Asked directly, not through the throttle: GitHub doesn't count rate_limit against any bucket,
-    # and status is what you run while buckets are blocked.
-    resp = http.send("GET", "rate_limit", caller.token(), timeout=30)
-    if resp.status != 200:
-        hint = " (GitHub rejected the token: run `gh auth login`, or check GH_TOKEN)" if resp.status == 401 else ""
-        raise core.TollboothError(f"GET rate_limit answered HTTP {resp.status}{hint}", core.EX_FAIL)
+    body = caller.rate_limit()  # outside the throttle (ADR-0001): it works while buckets are blocked
     try:
-        resources = _RateLimit.model_validate_json(resp.body).resources
+        resources = _RateLimit.model_validate_json(body).resources
     except ValidationError:
         raise core.TollboothError("GET rate_limit: the answer is not GitHub's rate-limit document",
                                   core.EX_FAIL) from None
@@ -203,8 +199,6 @@ def call(ctx: click.Context, label: str | None, budget: int | None, no_cache: bo
                                   core.EX_USAGE)
     try:
         resp = caller.fetch(req.method, req.path, accept=req.accept, json_body=req.json_body)
-    except ValueError as e:  # the guard let through something tollbooth_http refuses
-        raise core.TollboothError(f"refused: {e}", core.EX_USAGE) from None
     except tollbooth_throttle.StoppedOnAnswer as e:  # a 502/504 or a rate limit: GitHub's answer, then the exit
         _write_answer(e.answer, req)
         raise

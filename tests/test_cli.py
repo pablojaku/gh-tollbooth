@@ -345,6 +345,27 @@ class StateFolder(CliCase):
         self.send.assert_not_called()
 
 
+class Bugs(CliCase):
+    """A bug's exception is still one line on stderr and exit 1, never a traceback."""
+
+    def test_a_bug_is_one_line_saying_internal_error(self):
+        with mock.patch.object(cli.Caller, "fetch", side_effect=ValueError("bad\x1bthing")):
+            code, out, err = self.main(["call", "--", "api", "repos/o/r"])
+        self.assertEqual((code, out), (core.EX_FAIL, ""))
+        self.assertEqual(err, "gh-tollbooth: internal error (ValueError: bad?thing); please report it\n")
+
+    def test_its_message_is_cut(self):
+        with mock.patch.object(cli.Caller, "fetch", side_effect=KeyError("x" * 500)):
+            _, _, err = self.main(["call", "--", "api", "repos/o/r"])
+        self.assertIn("x" * 190, err)
+        self.assertLess(len(err), 300)
+
+    def test_click_still_exits_its_own_way(self):
+        code, _, err = self.main(["status", "--last", "-1"])
+        self.assertEqual(code, 2)
+        self.assertNotIn("internal error", err)
+
+
 class NeverATraceback(unittest.TestCase):
     """Real processes: these failures happen outside what a test can hand to the command."""
 

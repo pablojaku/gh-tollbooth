@@ -90,15 +90,20 @@ class Answers(LoopCase):
 
 
 class NothingCharged(LoopCase):
-    def test_a_request_it_would_refuse(self):
-        with self.assertRaises(ValueError):
+    """Every failure is a TollboothError with its exit code: a command catches one kind."""
+
+    def test_a_request_it_would_refuse_is_exit_2(self):
+        with self.assertRaises(core.TollboothError) as cm:
             self.fetch("DELETE", "repos/o/r")
+        self.assertEqual(cm.exception.code, core.EX_USAGE)
+        self.assertTrue(str(cm.exception).startswith("refused: "), cm.exception)
         self.assertEqual((self.send.call_count, self.throttle.used("lab")), (0, 0))
 
-    def test_no_token(self):
+    def test_no_token_is_exit_1(self):
         self.token.side_effect = http.NoToken("no GitHub token: run `gh auth login`")
-        with self.assertRaises(http.NoToken):
+        with self.assertRaises(core.TollboothError) as cm:
             self.fetch()
+        self.assertEqual((cm.exception.code, str(cm.exception)), (core.EX_FAIL, "no GitHub token: run `gh auth login`"))
         self.assertEqual((self.send.call_count, self.throttle.used("lab")), (0, 0))
 
 
@@ -172,12 +177,44 @@ class GitHubGaveUp(LoopCase):
         self.assertEqual(cm.exception.code, core.EX_HEAVY)
         self.assertIn("Try again later", str(cm.exception))
 
-    def test_no_answer_is_charged_logged_with_status_0_and_raised(self):
+    def test_no_answer_is_charged_logged_with_status_0_and_exit_1(self):
         self.answers = [http.TransportError("timeout", "no answer in 90 s")]
-        with self.assertRaises(http.TransportError):
+        with self.assertRaises(core.TollboothError) as cm:
             self.fetch()
+        self.assertEqual(cm.exception.code, core.EX_FAIL)
+        self.assertIn("no answer from GitHub", str(cm.exception))
         self.assertEqual((self.statuses(), self.throttle.used("lab")), ([0], 1))
 
+
+
+class RateLimit(LoopCase):
+    """Caller.rate_limit(): GitHub's own counts, asked for outside the throttle (ADR-0001)."""
+
+    def test_is_one_request_that_skips_the_throttle(self):
+        self.throttle._mark("core", {b: self.clock.now() + 600 for b in throttling.BUCKETS})  # every bucket blocked
+        self.answers = [answer(200, body=b'{"resources": {}}')]
+        self.assertEqual(self.caller.rate_limit(), b'{"resources": {}}')
+        self.send.assert_called_once_with("GET", "rate_limit", TOKEN, timeout=30)
+        self.assertEqual((self.clock.sleeps, self.throttle.used("lab"), self.throttle.entries()), ([], 0, []))
+
+    def test_github_saying_no_is_exit_1(self):
+        for resp, words in ((answer(401), "gh auth login"), (answer(503), "HTTP 503")):
+            self.answers = [resp]
+            with self.assertRaises(core.TollboothError) as cm:
+                self.caller.rate_limit()
+            self.assertEqual(cm.exception.code, core.EX_FAIL)
+            self.assertIn(words, str(cm.exception))
+
+    def test_no_token_or_no_answer_is_exit_1(self):
+        self.answers = [http.TransportError("timeout", "no answer in 30 s")]
+        with self.assertRaises(core.TollboothError) as cm:
+            self.caller.rate_limit()
+        self.assertEqual(cm.exception.code, core.EX_FAIL)
+        self.assertIn("no answer from GitHub", str(cm.exception))
+        self.token.side_effect = http.NoToken("no GitHub token")
+        with self.assertRaises(core.TollboothError) as cm:
+            loop.Caller("lab", None, self.throttle).rate_limit()
+        self.assertEqual(cm.exception.code, core.EX_FAIL)
 
 
 class Check(LoopCase):
