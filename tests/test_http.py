@@ -1,4 +1,4 @@
-"""tollbooth_http tests: the one request it can send.
+"""tollbooth_http tests: the token, the one request it can send, and rate limits read from headers.
 
 The tests that send use a real HTTP server on 127.0.0.1, so they check what httpx really does with
 redirects, timeouts, framing and headers. Nothing leaves the machine and `gh` is never run.
@@ -6,6 +6,7 @@ Run: uv run pytest
 """
 import json
 import os
+import subprocess
 import threading
 import time
 import unittest
@@ -13,9 +14,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, cast
 from unittest import mock
 
-import tollbooth_http as http
+from _fixtures import WALL0, answer, http, primary, secondary
 
 TOKEN = "ghx_FAKEtokenFAKEtoken"
+# documentation_url values GitHub has sent with "You have exceeded a secondary rate limit" (2022 and 2024 forms)
+SECONDARY_DOCS = (
+    "https://docs.github.com/free-pro-team@latest/rest/overview/rate-limits-for-the-rest-api#about-secondary-rate-limits",
+    "https://docs.github.com/en/free-pro-team@latest/rest/overview/resources-in-the-rest-api#secondary-rate-limits",
+)
+
+
+def error_body(documentation_url: str) -> bytes:
+    return json.dumps({"message": "You have exceeded a secondary rate limit. Please wait a few minutes before you "
+                                  "try again.", "documentation_url": documentation_url}).encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -273,6 +284,136 @@ class ContentLength(LoopbackCase):
             with self.assertRaises(http.TransportError, msg=headers) as cm:
                 http.send("GET", "repos/o/r", TOKEN)
             self.assertEqual(cm.exception.kind, "error")
+
+
+class Token(unittest.TestCase):
+    def token(self, env, gh=None):
+        """Run http.token() with exactly `env`; `gh` is the fake `gh auth token` result or exception."""
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(http.subprocess, "run", side_effect=gh if isinstance(gh, Exception) else None,
+                                  return_value=gh) as run:
+            self.run_mock = run
+            return http.token()
+
+    def gh(self, rc=0, out=TOKEN + "\n"):
+        return subprocess.CompletedProcess(["gh"], rc, out, "")
+
+    def test_environment_wins_in_ghs_order(self):
+        self.assertEqual(self.token({"GH_TOKEN": "a1", "GITHUB_TOKEN": "b2"}), "a1")
+        self.assertEqual(self.token({"GITHUB_TOKEN": " b2\n"}), "b2")
+        self.run_mock.assert_not_called()
+        self.assertEqual(self.token({"GH_TOKEN": "  "}, self.gh()), TOKEN)  # blank counts as unset
+
+    def test_falls_back_to_ghs_stored_login(self):
+        env = {"PATH": "/usr/bin", "HOME": "/home/u", "OPENAI_API_KEY": "sk-secret", "GH_HOST": "evil.example",
+               "GH_CONFIG_DIR": "/cfg", "HTTPS_PROXY": "http://proxy:1"}
+        self.assertEqual(self.token(env, self.gh()), TOKEN)
+        (argv,), kwargs = self.run_mock.call_args
+        self.assertEqual(argv, ["gh", "auth", "token", "--hostname", "github.com"])
+        self.assertEqual(kwargs["env"]["PATH"], "/usr/bin")
+        self.assertEqual(kwargs["env"]["GH_CONFIG_DIR"], "/cfg")
+        self.assertEqual(kwargs["env"]["HTTPS_PROXY"], "http://proxy:1")  # gh may refresh an expiring token
+        self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
+        self.assertNotIn("GH_HOST", kwargs["env"])
+        self.assertLessEqual(kwargs["timeout"], 30)
+
+    def test_no_token(self):
+        for gh in (FileNotFoundError(), PermissionError(), subprocess.TimeoutExpired(["gh"], 15), self.gh(rc=1, out=""),
+                   self.gh(rc=0, out="\n"), self.gh(rc=4, out=TOKEN)):
+            with self.assertRaises(http.NoToken, msg=gh) as cm:
+                self.token({}, gh)
+            self.assertNotIn(TOKEN, str(cm.exception))
+
+    def test_a_token_that_could_break_the_header_is_refused_without_echoing_it(self):
+        cases = [({"GH_TOKEN": bad}, None) for bad in ("ghx_FAKE\nX-Evil: 1", "ghx FAKE", "ghx_FAKé")]
+        cases += [({}, self.gh(out=bad)) for bad in ("ghx_FAKE\nX-Evil: 1", "ghx FAKE", "ghx_FAKE\x00", "ghx_FAKé")]
+        for env, gh in cases:
+            with self.assertRaises(http.NoToken, msg=(env, gh)) as cm:
+                self.token(env, gh)
+            self.assertNotIn("FAK", str(cm.exception))
+
+
+class Classify(unittest.TestCase):
+    """The status code and GitHub's rate-limit headers decide; text never does.
+
+    One field of a 403's body is read as well: the documentation_url GitHub sets."""
+
+    def test_table(self):
+        now = WALL0
+        ok_headers = {"X-RateLimit-Remaining": "12", "X-RateLimit-Reset": int(now + 900)}
+        self.assertEqual(http.classify(answer(502), now).kind, "heavy")
+        self.assertEqual(http.classify(answer(504), now).kind, "heavy")
+        v = http.classify(secondary(30, 403), now)
+        self.assertEqual((v.kind, v.delay), ("secondary", 30.0))
+        self.assertEqual(http.classify(secondary(0), now).delay, 1.0)  # never a zero wait
+        v = http.classify(secondary(), now)  # a bare 429: the caller picks the backoff
+        self.assertEqual((v.kind, v.delay), ("secondary", None))
+        v = http.classify(primary(now + 100, resource="search"), now)
+        self.assertEqual((v.kind, v.bucket), ("primary", "search"))
+        self.assertAlmostEqual(v.delay, 102, delta=0.01)
+        self.assertEqual(http.classify(primary(now - 100), now).delay, 1.0)  # reset in the past: tiny, not negative
+        self.assertIsNone(http.classify(answer(403, ok_headers), now).kind)  # a permission error
+        self.assertIsNone(http.classify(answer(404, ok_headers), now).kind)
+        self.assertIsNone(http.classify(answer(200, ok_headers), now).kind)
+        self.assertIsNone(http.classify(answer(301), now).kind)
+
+    def test_a_graphql_200_is_a_limit_only_when_it_failed_with_nothing_left(self):
+        now = WALL0
+        spent = primary(now + 20, status=200, resource="graphql")
+        self.assertIsNone(http.classify(spent, now).kind)  # the last allowed call still succeeded
+        self.assertEqual(http.classify(spent, now, failed=True).kind, "primary")
+        left = answer(200, {"X-RateLimit-Remaining": "12", "X-RateLimit-Reset": int(now + 900)})
+        self.assertIsNone(http.classify(left, now, failed=True).kind)  # an ordinary GraphQL error
+
+    def test_text_never_decides(self):
+        body = b'{"message": "API rate limit exceeded for user ID 1. You have exceeded a secondary rate limit"}'
+        for status in (200, 403, 404, 422):
+            r = answer(status, {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": int(WALL0 + 900)}, body)
+            self.assertIsNone(http.classify(r, WALL0, failed=True).kind, status)
+
+    def test_a_403_that_links_the_secondary_limit_docs_is_a_secondary_limit(self):
+        # GitHub can send a secondary limit with no Retry-After and with requests remaining. The only
+        # thing that tells it from a permission error is the documentation_url GitHub puts in the body.
+        left = {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": int(WALL0 + 900), "X-RateLimit-Resource": "core"}
+        for url in SECONDARY_DOCS:
+            v = http.classify(answer(403, left, error_body(url)), WALL0)
+            self.assertEqual((v.kind, v.delay, v.bucket), ("secondary", None, "core"), url)
+        self.assertEqual(http.classify(answer(403, {}, error_body(SECONDARY_DOCS[0])), WALL0).kind, "secondary")
+        # the headers still come first when GitHub sends them
+        v = http.classify(answer(403, {"Retry-After": "30"}, error_body(SECONDARY_DOCS[0])), WALL0)
+        self.assertEqual((v.kind, v.delay), ("secondary", 30.0))
+        spent = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": int(WALL0 + 100)}
+        self.assertEqual(http.classify(answer(403, spent, error_body(SECONDARY_DOCS[0])), WALL0).kind, "primary")
+
+    def test_only_that_one_field_of_a_403_is_read(self):
+        doc = SECONDARY_DOCS[0]
+        left = {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": int(WALL0 + 900)}
+        for status in (200, 404, 422, 500):  # only a 403 is looked at
+            self.assertIsNone(http.classify(answer(status, left, error_body(doc)), WALL0, failed=True).kind, status)
+        not_it = [
+            json.dumps({"message": f"see {doc}", "documentation_url": "https://docs.github.com/rest"}),  # text only
+            json.dumps({"errors": [{"documentation_url": doc}]}),                 # not the top-level field
+            json.dumps([{"documentation_url": doc}]),
+            json.dumps({"documentation_url": [doc]}),
+            json.dumps({"documentation_url": doc + "\n"}),
+            json.dumps({"documentation_url": doc.replace("docs.github.com", "evil.example")}),
+            json.dumps({"documentation_url": doc.replace("docs.github.com", "docs.github.com.evil.example")}),
+            json.dumps({"documentation_url": doc.replace("https://", "http://")}),
+            json.dumps({"documentation_url": doc.replace("secondary", "primary")}),  # the primary-limit docs
+            json.dumps({"documentation_url": "https://docs.github.com/rest#permissions"}),
+            "<html>" + doc, "", "[" * 100_000, '{"documentation_url": "%s", "pad": "%s"}' % (doc, "x" * 70_000),
+        ]
+        for body in not_it:
+            r = answer(403, left, body.encode())
+            self.assertIsNone(http.classify(r, WALL0).kind, body[:80])
+        self.assertIsNone(http.classify(answer(403, left, b"\xff\xfe"), WALL0).kind)
+
+    def test_junk_headers_are_not_a_limit(self):
+        for headers in ({"Retry-After": "soon"}, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "later"},
+                        {"X-RateLimit-Remaining": "0"},
+                        {"Retry-After": "9" * 400},  # too big for a float: not a wait, and not a crash
+                        {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "9" * 400}):
+            self.assertIsNone(http.classify(answer(403, headers), WALL0).kind, headers)
 
 
 if __name__ == "__main__":

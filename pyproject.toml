@@ -5,6 +5,7 @@ description = "One machine-wide, throttled, read-only request stream to GitHub f
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28.1",
+    "pydantic>=2.14.4",
 ]
 
 [dependency-groups]
