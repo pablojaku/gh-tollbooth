@@ -20,7 +20,7 @@ from click.testing import CliRunner
 
 from _fixtures import SCRIPTS, answer
 
-core, http = cli.core, cli.http
+core, http, throttling = cli.core, cli.http, cli.tollbooth_throttle
 TOKEN = "ghx_FAKEtokenFAKEtoken"
 RESET = 1_800_000_600
 RATE_LIMIT = json.dumps({"resources": {
@@ -92,17 +92,17 @@ class Status(CliCase):
     def test_is_one_free_request_outside_the_throttle(self):
         self.main(["--as", "lab", "status"])
         self.send.assert_called_once_with("GET", "rate_limit", TOKEN, timeout=30)
-        throttle = core.Throttle(self.state)
+        throttle = throttling.Throttle(self.state)
         self.assertEqual((throttle.used("lab"), throttle.entries()), (0, []))
 
     def test_flags_a_bucket_another_agent_blocked(self):
-        core.Throttle(self.state).mark("search", {"search": time.time() + 120})
+        throttling.Throttle(self.state).mark("search", {"search": time.time() + 120})
         _, out, _ = self.main(["status"])
         flagged = [ln.split()[0] for ln in out.splitlines() if "BLOCKED until" in ln]
         self.assertEqual(flagged, ["search"])
 
     def test_lists_recent_calls_by_label(self):
-        throttle = core.Throttle(self.state)
+        throttle = throttling.Throttle(self.state)
         for i in range(3):
             throttle.log("scout", "search", 200, 0.4, f"GET search/repositories?q=term{i}")
         throttle.log("other", "graphql", 502, 9.9, "POST graphql")
@@ -114,7 +114,7 @@ class Status(CliCase):
         self.assertNotIn("term0", out)  # --last 2 shows the two newest calls
 
     def test_last_zero_lists_no_calls_and_a_negative_count_is_refused(self):
-        throttle = core.Throttle(self.state)
+        throttle = throttling.Throttle(self.state)
         for i in range(3):
             throttle.log("scout", "search", 200, 0.4, f"GET search/repositories?q=term{i}")
         _, out, _ = self.main(["status", "--last", "0"])
@@ -124,7 +124,7 @@ class Status(CliCase):
         self.assertEqual(code, core.EX_USAGE)
 
     def test_control_characters_are_never_printed(self):
-        core.Throttle(self.state).log("scout", "core", 200, 0.1, "GET q=\x1b[2J\x07")
+        throttling.Throttle(self.state).log("scout", "core", 200, 0.1, "GET q=\x1b[2J\x07")
         doc = json.loads(RATE_LIMIT)
         doc["resources"]["core"].update(limit="\x1b[31m5000", remaining="\x1b]0;x\x07")
         code, out, _ = self.main(["status"], send=answer(200, body=json.dumps(doc).encode()))
@@ -157,7 +157,7 @@ class Status(CliCase):
         self.assertIn("no answer in 30 s", err)
 
     def test_logged_text_this_locale_cannot_print_is_shown_with_question_marks(self):
-        core.Throttle(self.state).log("scout", "core", 200, 0.1, "GET café ☃")
+        throttling.Throttle(self.state).log("scout", "core", 200, 0.1, "GET café ☃")
         raw = io.BytesIO()
         out = io.TextIOWrapper(raw, encoding="latin-1")  # strict, as under LANG=en_US.ISO8859-1
         with mock.patch.object(http, "send", return_value=answer(200, body=RATE_LIMIT)), \

@@ -27,6 +27,7 @@ from pydantic import BaseModel, BeforeValidator, Field, ValidationError  # noqa:
 
 import tollbooth_core as core  # noqa: E402
 import tollbooth_http as http  # noqa: E402
+import tollbooth_throttle  # noqa: E402
 
 BUCKETS = ("graphql", "core", "search", "code_search")
 LABEL_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # always use .fullmatch: "$" would accept a trailing newline
@@ -68,7 +69,7 @@ class _RateLimit(BaseModel):
 class Run:
     label: str
     budget: int | None
-    throttle: core.Throttle
+    throttle: tollbooth_throttle.Throttle
 
 
 def _clock(at: float) -> str:
@@ -90,7 +91,7 @@ def _start(ctx: click.Context, label: str | None, budget: int | None) -> Run:
         raise click.UsageError("--budget needs a unique --as LABEL (calls are counted per label)")
     folder = core.SETTINGS.state_dir
     try:
-        throttle = core.Throttle(folder)
+        throttle = tollbooth_throttle.Throttle(folder)
     except OSError as e:
         raise core.TollboothError(f"can't create the state folder {folder} ({e.strerror or e}); "
                                   "set TOLLBOOTH_STATE_DIR to a folder you can write to", core.EX_FAIL) from None
@@ -176,9 +177,9 @@ def status(ctx: click.Context, label: str | None, budget: int | None, last: int)
     for name in BUCKETS:
         b: _Bucket = getattr(resources, name)
         left = run.throttle.blocked_for(name)
-        blocked = f"  BLOCKED until {_clock(core.wall_clock() + left)}" if left > 0 else ""
+        blocked = f"  BLOCKED until {_clock(tollbooth_throttle.wall_clock() + left)}" if left > 0 else ""
         click.echo(f"{name:13} {_shown(b.remaining):>6}/{_shown(b.limit):<6}  {_clock(b.reset)}{blocked}")
-    recent = run.throttle.entries(since=core.wall_clock() - 3600)
+    recent = run.throttle.entries(since=tollbooth_throttle.wall_clock() - 3600)
     click.echo(f"\ngh-tollbooth calls in the last hour: {len(recent)}")
     for (who, bucket), n in Counter((c.label, c.bucket) for c in recent).most_common(15):
         click.echo(f"  {n:4}  {bucket:12} {who}")

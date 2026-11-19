@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 import tollbooth_core as core
+import tollbooth_throttle as throttling
 from _fixtures import SCRIPTS, WALL0, FakeClock
 
 
@@ -24,14 +25,14 @@ class StateCase(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name) / "state"
         self.clock = FakeClock()
-        p = mock.patch.object(core, "wall_clock", self.clock.now)
+        p = mock.patch.object(throttling, "wall_clock", self.clock.now)
         p.start()
         self.addCleanup(p.stop)
-        self.throttle = core.Throttle(self.dir)
+        self.throttle = throttling.Throttle(self.dir)
 
     def other_agent(self):
         """A second Throttle on the same state folder, as another process would have."""
-        return core.Throttle(self.dir)
+        return throttling.Throttle(self.dir)
 
     def rows(self, sql: str) -> list:
         """Rows straight from state.db, to see what is stored."""
@@ -46,9 +47,9 @@ class Spacing(StateCase):
     def test_the_gap_is_what_is_left_of_the_buckets_spacing(self):
         self.assertEqual(self.throttle.spacing_gap("search"), 0.0)  # no call yet
         self.throttle.mark("search")
-        self.assertAlmostEqual(self.other_agent().spacing_gap("search"), core.SPACING["search"])
+        self.assertAlmostEqual(self.other_agent().spacing_gap("search"), throttling.SPACING["search"])
         self.clock.sleep(1.0)
-        self.assertAlmostEqual(self.throttle.spacing_gap("search"), core.SPACING["search"] - 1.0)
+        self.assertAlmostEqual(self.throttle.spacing_gap("search"), throttling.SPACING["search"] - 1.0)
         self.clock.sleep(5.0)
         self.assertEqual(self.throttle.spacing_gap("search"), 0.0)
 
@@ -70,8 +71,8 @@ class Spacing(StateCase):
 class Blocks(StateCase):
     def test_a_block_is_seen_by_every_agent(self):
         self.assertEqual(self.throttle.blocked_for("core"), 0.0)
-        self.throttle.mark("graphql", {b: self.clock.now() + 30 for b in core.SPACING})
-        for b in core.SPACING:
+        self.throttle.mark("graphql", {b: self.clock.now() + 30 for b in throttling.SPACING})
+        for b in throttling.SPACING:
             self.assertAlmostEqual(self.other_agent().blocked_for(b), 30, delta=0.01)
         self.clock.sleep(31)
         self.assertLessEqual(self.throttle.blocked_for("core"), 0)
@@ -83,10 +84,10 @@ class Blocks(StateCase):
 
     def test_a_block_longer_than_an_hour_is_capped_not_dropped(self):
         self.throttle.mark("core", {"core": self.clock.now() + 7200})  # e.g. Retry-After: 7200
-        self.assertAlmostEqual(self.other_agent().blocked_for("core"), core.BLOCK_CAP, delta=0.01)
+        self.assertAlmostEqual(self.other_agent().blocked_for("core"), throttling.BLOCK_CAP, delta=0.01)
         self.clock.wall -= 60  # the wall clock steps back a minute: the capped block must still count
-        self.assertAlmostEqual(self.throttle.blocked_for("core"), core.BLOCK_CAP + 60, delta=0.01)
-        self.clock.sleep(core.BLOCK_CAP + 61)
+        self.assertAlmostEqual(self.throttle.blocked_for("core"), throttling.BLOCK_CAP + 60, delta=0.01)
+        self.clock.sleep(throttling.BLOCK_CAP + 61)
         self.assertLessEqual(self.throttle.blocked_for("core"), 0)
 
     def test_a_block_too_far_ahead_is_ignored_and_overwritten(self):
@@ -145,7 +146,7 @@ class StateFile(StateCase):
         self.throttle.charge("lab")
         self.assertEqual(self.throttle.used("lab"), 2)
         self.assertAlmostEqual(self.throttle.blocked_for("search"), 30, delta=0.01)
-        self.assertAlmostEqual(self.throttle.spacing_gap("core"), core.SPACING["core"])
+        self.assertAlmostEqual(self.throttle.spacing_gap("core"), throttling.SPACING["core"])
 
     @unittest.skipIf(os.geteuid() == 0, "root can open a file without permission")
     def test_a_file_that_cannot_be_opened_is_an_error_not_empty(self):
@@ -172,7 +173,7 @@ class StateFile(StateCase):
         holder = sqlite3.connect(self.throttle.db_path, isolation_level=None)
         self.addCleanup(holder.close)
         holder.execute("BEGIN IMMEDIATE")  # another agent in the middle of a change
-        with mock.patch.object(core, "STATE_WAIT", 0.1), self.assertRaises(core.TollboothError) as cm:
+        with mock.patch.object(throttling, "STATE_WAIT", 0.1), self.assertRaises(core.TollboothError) as cm:
             self.throttle.charge("lab")
         self.assertEqual(cm.exception.code, core.EX_BUSY)
 
@@ -192,7 +193,7 @@ class FolderVanishes(StateCase):
                     con.execute("SELECT count(*) FROM sqlite_master").fetchone()
                 shutil.rmtree(self.dir)
             return con
-        return mock.patch.object(core.sqlite3, "connect", connect)
+        return mock.patch.object(throttling.sqlite3, "connect", connect)
 
     def test_before_a_step(self):
         shutil.rmtree(self.dir)
@@ -214,7 +215,7 @@ class FolderVanishes(StateCase):
 class CallLog(StateCase):
     def test_a_call_comes_back_as_one_record(self):
         self.throttle.log("lab", "search", 200, 1.234, "GET search/repositories?q=x")
-        self.assertEqual(self.throttle.entries(), [core.Call(WALL0, "lab", os.getpid(), "search", 200, 1.234,
+        self.assertEqual(self.throttle.entries(), [throttling.Call(WALL0, "lab", os.getpid(), "search", 200, 1.234,
                                                              "GET search/repositories?q=x")])
 
     def test_what_was_asked_is_one_line_of_at_most_160_characters(self):
@@ -230,7 +231,7 @@ class CallLog(StateCase):
         self.assertEqual([c.summary for c in self.throttle.entries(since=self.clock.now() - 3600)], ["GET new"])
 
     def test_the_log_keeps_its_newest_calls(self):
-        with mock.patch.object(core, "LOG_KEEP", 50):
+        with mock.patch.object(throttling, "LOG_KEEP", 50):
             for i in range(60):
                 self.throttle.log("lab", "core", 200, 0.1, f"GET {i}")
         summaries = [c.summary for c in self.throttle.entries()]
@@ -253,7 +254,7 @@ class CallLog(StateCase):
         # the log is informational: failing to write it must not fail the command
         holder = sqlite3.connect(self.throttle.db_path, isolation_level=None)
         holder.execute("BEGIN IMMEDIATE")
-        with mock.patch.object(core, "STATE_WAIT", 0.1):
+        with mock.patch.object(throttling, "STATE_WAIT", 0.1):
             self.throttle.log("lab", "core", 200, 0.1, "GET x")  # gives up waiting for the busy file
         holder.close()
         self.assertEqual(self.throttle.entries(), [])
@@ -274,8 +275,8 @@ class ManyProcesses(unittest.TestCase):
     WORKER = """
 import sys, time
 sys.path.insert(0, sys.argv[1])
-import tollbooth_core as core
-t = core.Throttle(sys.argv[2])
+import tollbooth_throttle as throttling
+t = throttling.Throttle(sys.argv[2])
 def step():
     hour = t.charge("lab"); t.charge("lab"); t.refund("lab", hour); t.mark("core"); t.log("lab", "core", 200, 0.1, "GET x")
 for _ in range(40):
@@ -292,7 +293,7 @@ for _ in range(40):
                                       stderr=subprocess.PIPE, text=True) for _ in range(6)]
             errors = [p.communicate()[1][-300:] for p in procs]
             self.assertEqual([p.returncode for p in procs], [0] * 6, errors)
-            t = core.Throttle(Path(d))
+            t = throttling.Throttle(Path(d))
             self.assertEqual((t.used("lab"), len(t.entries())), (240, 240))
 
     def test_writers_outside_the_lock_lose_nothing(self):

@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 import tollbooth_core as core
+import tollbooth_throttle as throttling
 from filelock import FileLock, Timeout
 
 
@@ -68,7 +69,7 @@ class LockCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.state = Path(tmp.name) / "state"
-        self.throttle = core.Throttle(self.state)
+        self.throttle = throttling.Throttle(self.state)
 
     def held_elsewhere(self):
         """The lock, taken through a second open file, as another agent's process would."""
@@ -113,7 +114,7 @@ class Lock(LockCase):
         release = threading.Timer(0.6, fcntl.flock, (holder, fcntl.LOCK_UN))
         start = time.monotonic()
         release.start()
-        with mock.patch.object(core, "WAIT_NOTICE", 0.2), self.assertLogs("gh-tollbooth", "INFO") as logs:
+        with mock.patch.object(throttling, "WAIT_NOTICE", 0.2), self.assertLogs("gh-tollbooth", "INFO") as logs:
             with self.throttle.hold(start + 10):
                 waited = time.monotonic() - start
         release.join()
@@ -171,23 +172,23 @@ class InFolder(unittest.TestCase):
         return run, calls
 
     def test_a_vanished_folder_is_made_again_and_the_step_tried_again(self):
-        for code in core.VANISHED:
+        for code in throttling.VANISHED:
             run, calls = self.step(OSError(code, "gone"), OSError(code, "gone"))
-            self.assertEqual(core._in_folder(self.folder, run), "done")
+            self.assertEqual(throttling._in_folder(self.folder, run), "done")
             self.assertEqual(len(calls), 3, code)
             self.assertTrue(self.folder.is_dir())
 
     def test_any_other_error_goes_to_the_caller_at_once(self):
         run, calls = self.step(PermissionError(errno.EACCES, "no"))
         with self.assertRaises(PermissionError):
-            core._in_folder(self.folder, run)
+            throttling._in_folder(self.folder, run)
         self.assertEqual(len(calls), 1)
 
     def test_the_last_error_goes_to_the_caller_after_fs_retries_tries(self):
         run, calls = self.step(*[FileNotFoundError(errno.ENOENT, "gone")] * 10)
         with self.assertRaises(FileNotFoundError):
-            core._in_folder(self.folder, run)
-        self.assertEqual(len(calls), core.FS_RETRIES)
+            throttling._in_folder(self.folder, run)
+        self.assertEqual(len(calls), throttling.FS_RETRIES)
 
 
 if __name__ == "__main__":
