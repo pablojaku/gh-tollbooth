@@ -208,17 +208,24 @@ def call(ctx: click.Context, label: str | None, budget: int | None, no_cache: bo
 
 
 def _write_answer(resp: http.Response, req: CallRequest) -> None:
-    """GitHub's answer on stdout, byte for byte: with -i the status line and headers first; with --silent nothing."""
+    """GitHub's answer on stdout, byte for byte: with -i the status line and headers first; with --silent nothing.
+
+    A reader that closed the pipe (`| jq` that failed) gets nothing more, and the command goes on: its line
+    on stderr and its exit code still say what GitHub answered (exit 75 for a rate limit, not 0).
+    """
     if req.silent:
         return
-    sys.stdout.flush()  # anything printed as text goes first
-    out = sys.stdout.buffer
-    if req.include:
-        head = [f"HTTP/1.1 {resp.status} {REASONS.get(resp.status, '')}".rstrip()]
-        head += [f"{_header_name(k)}: {v}" for k, v in resp.headers.items()]
-        out.write("".join(printable(line) + "\n" for line in head).encode("utf-8", "replace") + b"\n")
-    out.write(resp.body)
-    out.flush()
+    try:
+        sys.stdout.flush()  # anything printed as text goes first
+        out = sys.stdout.buffer
+        if req.include:
+            head = [f"HTTP/1.1 {resp.status} {REASONS.get(resp.status, '')}".rstrip()]
+            head += [f"{_header_name(k)}: {v}" for k, v in resp.headers.items()]
+            out.write("".join(printable(line) + "\n" for line in head).encode("utf-8", "replace") + b"\n")
+        out.write(resp.body)
+        out.flush()
+    except BrokenPipeError:
+        _reader_left()
 
 
 def _header_name(name: str) -> str:

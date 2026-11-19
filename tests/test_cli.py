@@ -381,6 +381,18 @@ with mock.patch.object(cli.http, "send", return_value=answer(200, body=sys.argv[
     sys.exit(cli.main(["status"]))
 """
 
+    # `call` with a fake token and a GitHub that answers with a rate limit longer than TOLLBOOTH_MAX_WAIT
+    CHILD_LIMITED = """
+import sys, time
+from unittest import mock
+sys.path[:0] = [sys.argv[1], sys.argv[2]]
+from _fixtures import primary
+import tollbooth_cli as cli
+with mock.patch.object(cli.http, "send", return_value=primary(time.time() + 3000)), \\
+        mock.patch.object(cli.http, "token", return_value="ghx_FAKEtokenFAKEtoken"):
+    sys.exit(cli.main(["call", "--", "api", "repos/o/r"]))
+"""
+
     def env(self, folder: str, **extra) -> dict:
         env = {k: v for k, v in os.environ.items() if not k.startswith("TOLLBOOTH_")}
         return dict(env, TOLLBOOTH_STATE_DIR=str(Path(folder) / "state"), **extra)
@@ -396,6 +408,18 @@ with mock.patch.object(cli.http, "send", return_value=answer(200, body=sys.argv[
             err = p.stderr.read()
             p.stderr.close()
             self.assertEqual((p.wait(), err), (0, ""))
+
+    def test_a_reader_that_closes_the_pipe_still_gets_the_stop_line(self):
+        # `gh-tollbooth call -- api ... | jq 'bad['`: jq exits at once, and GitHub said "rate-limited"
+        with tempfile.TemporaryDirectory() as d:
+            p = subprocess.Popen([sys.executable, "-c", self.CHILD_LIMITED, str(SCRIPTS), str(Path(__file__).parent)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env(d))
+            assert p.stdout is not None and p.stderr is not None
+            p.stdout.close()  # before the child has written anything
+            err = p.stderr.read()
+            p.stderr.close()
+            self.assertEqual(p.wait(), core.EX_LIMITED, err)
+            self.assertRegex(err, r"^gh-tollbooth: core is rate-limited until \d\d:\d\d:\d\d\. Stop and report")
 
     def test_a_deadline_that_is_not_a_number(self):
         with tempfile.TemporaryDirectory() as d:
