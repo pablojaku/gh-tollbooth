@@ -14,13 +14,15 @@ that carries that answer, so a command can still show it.
 The Caller is the one seam between a command and GitHub: every failure comes out as a TollboothError
 with its exit code (no token or no answer: 1; a request tollbooth_http would refuse: 2), so a command
 catches one kind. Caller.rate_limit() asks GitHub's own counts outside the throttle (ADR-0001).
-Not here: the turn's rules (tollbooth_throttle) and the HTTP request itself (tollbooth_http).
+Not here: the turn's rules (tollbooth_throttle), the HTTP request itself (tollbooth_http) and what a
+GraphQL request looks like in the call log (tollbooth_graphql).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
 
+import tollbooth_graphql as gql
 import tollbooth_http as http
 import tollbooth_throttle as throttling
 from tollbooth_core import EX_FAIL, EX_HEAVY, EX_USAGE, TollboothError
@@ -77,7 +79,7 @@ class Caller:
             return resp, resp.status, _limit(http.classify(resp, clock.now(), path), bucket)
 
         try:
-            resp = self.throttle.turn(self.label, self.budget, bucket, deadline, _summary(method, path, json_body),
+            resp = self.throttle.turn(self.label, self.budget, bucket, deadline, gql.summary(method, path, json_body),
                                       send)
         except http.TransportError as e:  # charged and logged by the turn
             raise _no_answer(e) from None
@@ -119,16 +121,9 @@ def _limit(verdict: http.Verdict, bucket: str) -> throttling.Limit | None:
     return None
 
 
-def _summary(method: str, path: str, json_body: Any) -> str:
-    """What was asked, for the call log: the method, the path and a GraphQL document's text."""
-    query = json_body.get("query") if isinstance(json_body, dict) else None
-    return f"{method} {path} {query}" if isinstance(query, str) else f"{method} {path}"
-
-
 def _gave_up(method: str, path: str) -> TollboothError:
     """A 502 or 504: GitHub stopped working on the request. Only a GraphQL query can be made lighter."""
     if path == "graphql":
-        return TollboothError("GitHub gave up on the query (502/504: its 10 s limit). Make it lighter: "
-                              "fewer aliases, a smaller first:, fewer nested connections.", EX_HEAVY)
+        return TollboothError(gql.HEAVY_QUERY_ADVICE, EX_HEAVY)
     return TollboothError(f"GitHub timed out on {method} {path[:60]} (502/504). Try again later, or ask for less.",
                           EX_HEAVY)
