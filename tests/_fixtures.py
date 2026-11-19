@@ -1,8 +1,11 @@
 """Shared test fixtures: canned GitHub answers. pytest puts scripts/ on the import path (pyproject.toml)."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import tollbooth_http as http
 
+SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 WALL0 = 1_800_000_000.0
 
 

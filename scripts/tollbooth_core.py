@@ -3,18 +3,20 @@
 Settings are TOLLBOOTH_* environment variables, read by pydantic-settings. A bad value is ignored with
 one line on stderr and the default is used: a typo in one agent's environment must not stop its calls.
 The machine-wide lock is a filelock FileLock (flock on Unix) on `lock` in the shared state folder.
-The shared state (call times, blocks and budget charges) is one SQLite file there, state.db.
+The shared state (call times, blocks, budget charges and the call log) is one SQLite file there, state.db.
 Not here: talking to GitHub (tollbooth_http).
 """
 from __future__ import annotations
 
 import errno
 import logging
+import os
 import re
 import sqlite3
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
@@ -46,6 +48,9 @@ BLOCK_CAP = 3600           # seconds; GitHub limits reset hourly, so a longer wa
 BLOCK_STALE = 3700         # ...and a block further ahead than this can't be real (a clock step): it is ignored
 BUDGET_WINDOW_HOURS = 24   # a budget counts the charges of this hour and the 24 before it
 STATE_WAIT = 10            # seconds to wait for another agent's change to state.db (each is one short transaction)
+LOG_KEEP = 5000            # calls kept in the call log; older ones are deleted
+LOG_SUMMARY = 160          # characters kept of what each call asked
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # 1 = no token, no answer from GitHub, or no state folder; 75 = GitHub rate limit (stop, report the reset time);
 # 76 = gh-tollbooth busy or out of time (retry once later)
 EX_FAIL, EX_USAGE, EX_HEAVY, EX_BUDGET, EX_LIMITED, EX_BUSY = 1, 2, 3, 4, 75, 76
@@ -57,6 +62,9 @@ CREATE TABLE IF NOT EXISTS last_call (bucket TEXT PRIMARY KEY, at REAL NOT NULL)
 CREATE TABLE IF NOT EXISTS block (bucket TEXT PRIMARY KEY, until REAL NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS charge (label TEXT NOT NULL, hour INTEGER NOT NULL, n INTEGER NOT NULL CHECK (n >= 0),
                                    PRIMARY KEY (label, hour)) STRICT;
+CREATE TABLE IF NOT EXISTS call (id INTEGER PRIMARY KEY, at REAL NOT NULL, label TEXT NOT NULL, pid INTEGER NOT NULL,
+                                 bucket TEXT NOT NULL, status INTEGER NOT NULL, secs REAL NOT NULL,
+                                 summary TEXT NOT NULL) STRICT;
 """
 
 
@@ -64,6 +72,18 @@ class TollboothError(Exception):
     def __init__(self, msg: str, code: int):
         super().__init__(msg)
         self.code = code
+
+
+@dataclass(frozen=True)
+class Call:
+    """One row of the call log."""
+    at: float       # wall-clock Unix time
+    label: str
+    pid: int
+    bucket: str
+    status: int     # HTTP status, 0 if GitHub gave no answer
+    secs: float
+    summary: str    # what was asked, cut to LOG_SUMMARY characters, control characters as "?"
 
 
 # ---------- settings ----------
@@ -124,6 +144,11 @@ def wall_clock() -> float:
 def _busy(why: str) -> TollboothError:
     return TollboothError(f"{why}; gave up so this command doesn't hang (TOLLBOOTH_DEADLINE {SETTINGS.deadline} s). "
                           "gh-tollbooth is busy, not rate-limited: wait a minute and retry once.", EX_BUSY)
+
+
+def _printable(text: str) -> str:
+    """`text` with control characters as "?", so nothing in the log can drive a terminal."""
+    return CONTROL_RE.sub("?", text)
 
 
 def _vanished(e: BaseException) -> bool:
@@ -276,3 +301,25 @@ class Throttle:
         row = self._db(lambda con: con.execute(sql, (label, hour - BUDGET_WINDOW_HOURS, hour + 1)).fetchone(),
                        write=False)
         return row[0]
+
+    # ---- call log (informational; budgets don't depend on it) ----
+
+    def log(self, label: str, bucket: str, status: int, secs: float, summary: str) -> None:
+        """Add one call to the log and keep the newest LOG_KEEP. A call that can't be logged is dropped."""
+        summary = _printable(re.sub(r"\s+", " ", summary))[:LOG_SUMMARY]
+
+        def record(con: sqlite3.Connection) -> None:
+            con.execute("INSERT INTO call (at, label, pid, bucket, status, secs, summary) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (wall_clock(), label, os.getpid(), bucket, status, secs, summary))
+            con.execute("DELETE FROM call WHERE id <= (SELECT max(id) FROM call) - ?", (LOG_KEEP,))
+        try:
+            self._db(record)
+        except (sqlite3.Error, OSError, TollboothError):
+            pass
+
+    def entries(self, since: float = 0.0) -> list[Call]:
+        """Calls logged at or after `since` (wall-clock time), oldest first, control characters as "?"."""
+        rows = self._db(lambda con: con.execute("SELECT at, label, pid, bucket, status, secs, summary FROM call "
+                                                "WHERE at >= ? ORDER BY id", (since,)).fetchall(), write=False)
+        return [Call(at, _printable(label), pid, _printable(bucket), status, secs, _printable(summary))
+                for at, label, pid, bucket, status, secs, summary in rows]

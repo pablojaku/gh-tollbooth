@@ -1,18 +1,21 @@
-"""Shared-state tests: call spacing, rate-limit blocks and budgets, all in state.db.
+"""Shared-state tests: call spacing, rate-limit blocks, budgets and the call log, all in state.db.
 
 Mock-first: FakeClock replaces tollbooth_core.wall_clock, so times are exact and no test waits.
+ManyProcesses runs real processes on the real clock.
 Run: uv run pytest
 """
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import tollbooth_core as core
-from _fixtures import FakeClock
+from _fixtures import SCRIPTS, WALL0, FakeClock
 
 
 class StateCase(unittest.TestCase):
@@ -206,6 +209,97 @@ class FolderVanishes(StateCase):
         with self.deleting_after_connect(open_file_first=True):
             self.throttle.charge("lab")
         self.assertEqual(self.throttle.used("lab"), 1)  # the folder, and the first charge, are gone
+
+
+class CallLog(StateCase):
+    def test_a_call_comes_back_as_one_record(self):
+        self.throttle.log("lab", "search", 200, 1.234, "GET search/repositories?q=x")
+        self.assertEqual(self.throttle.entries(), [core.Call(WALL0, "lab", os.getpid(), "search", 200, 1.234,
+                                                             "GET search/repositories?q=x")])
+
+    def test_what_was_asked_is_one_line_of_at_most_160_characters(self):
+        self.throttle.log("lab", "graphql", 200, 0.1, "POST graphql query {\n\tviewer { login }\n}" + "x" * 300)
+        (call,) = self.throttle.entries()
+        self.assertEqual(len(call.summary), 160)
+        self.assertTrue(call.summary.startswith("POST graphql query { viewer { login } }"))
+
+    def test_since_leaves_out_older_calls(self):
+        self.throttle.log("lab", "core", 200, 0.1, "GET old")
+        self.clock.sleep(3601)
+        self.throttle.log("lab", "core", 200, 0.1, "GET new")
+        self.assertEqual([c.summary for c in self.throttle.entries(since=self.clock.now() - 3600)], ["GET new"])
+
+    def test_the_log_keeps_its_newest_calls(self):
+        with mock.patch.object(core, "LOG_KEEP", 50):
+            for i in range(60):
+                self.throttle.log("lab", "core", 200, 0.1, f"GET {i}")
+        summaries = [c.summary for c in self.throttle.entries()]
+        self.assertEqual((len(summaries), summaries[0], summaries[-1]), (50, "GET 10", "GET 59"))
+
+    def test_control_characters_never_come_back_from_the_log(self):
+        # another agent's query text must not drive the terminal of whoever runs `status`
+        self.throttle.log("lab", "core", 200, 0.1, "GET q=\x1b[2J\x1b]0;title\x07 end\x00\x7f\x9b")
+        self.assertNotIn("\x1b", self.rows("SELECT summary FROM call")[0][0])
+        con = sqlite3.connect(self.throttle.db_path)  # a writer that did not clean its text
+        con.execute("INSERT INTO call (at, label, pid, bucket, status, secs, summary) "
+                    "VALUES (?, 'lab\x1b', 1, 'core', 200, 0.1, 'GET \x1b[31mred')", (WALL0,))
+        con.commit()
+        con.close()
+        first, second = self.throttle.entries()
+        self.assertEqual((first.summary, second.label, second.summary),
+                         ("GET q=?[2J?]0;title? end???", "lab?", "GET ?[31mred"))
+
+    def test_a_call_that_cannot_be_logged_is_dropped(self):
+        # the log is informational: failing to write it must not fail the command
+        holder = sqlite3.connect(self.throttle.db_path, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        with mock.patch.object(core, "STATE_WAIT", 0.1):
+            self.throttle.log("lab", "core", 200, 0.1, "GET x")  # gives up waiting for the busy file
+        holder.close()
+        self.assertEqual(self.throttle.entries(), [])
+
+    def test_budgets_do_not_depend_on_the_log(self):
+        self.throttle.charge("lab")
+        self.throttle.log("lab", "core", 200, 0.1, "GET repos/o/r")
+        con = sqlite3.connect(self.throttle.db_path)
+        con.execute("DELETE FROM call")
+        con.commit()
+        con.close()
+        self.assertEqual(self.throttle.used("lab"), 1)
+
+
+class ManyProcesses(unittest.TestCase):
+    """Real processes, real clock: changes to state.db are safe with or without the machine-wide lock."""
+
+    WORKER = """
+import sys, time
+sys.path.insert(0, sys.argv[1])
+import tollbooth_core as core
+t = core.Throttle(sys.argv[2])
+def step():
+    hour = t.charge("lab"); t.charge("lab"); t.refund("lab", hour); t.mark("core"); t.log("lab", "core", 200, 0.1, "GET x")
+for _ in range(40):
+    if sys.argv[3] == "hold":
+        with t.hold(time.monotonic() + 60):
+            step()
+    else:
+        step()
+"""
+
+    def run_workers(self, mode: str):
+        with tempfile.TemporaryDirectory() as d:
+            procs = [subprocess.Popen([sys.executable, "-c", self.WORKER, str(SCRIPTS), d, mode],
+                                      stderr=subprocess.PIPE, text=True) for _ in range(6)]
+            errors = [p.communicate()[1][-300:] for p in procs]
+            self.assertEqual([p.returncode for p in procs], [0] * 6, errors)
+            t = core.Throttle(Path(d))
+            self.assertEqual((t.used("lab"), len(t.entries())), (240, 240))
+
+    def test_writers_outside_the_lock_lose_nothing(self):
+        self.run_workers("free")
+
+    def test_writers_inside_the_lock_lose_nothing(self):
+        self.run_workers("hold")
 
 
 if __name__ == "__main__":
