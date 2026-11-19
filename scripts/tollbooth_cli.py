@@ -16,6 +16,7 @@ import re
 import sys
 from collections import Counter
 from contextlib import suppress
+from http.client import responses as REASONS
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -27,11 +28,13 @@ from pydantic import BaseModel, BeforeValidator, Field, ValidationError  # noqa:
 import tollbooth_core as core  # noqa: E402
 import tollbooth_http as http  # noqa: E402
 import tollbooth_throttle  # noqa: E402
+from tollbooth_guard import CallRequest, parse_call  # noqa: E402
 from tollbooth_loop import Caller  # noqa: E402
 
 BUCKETS = ("graphql", "core", "search", "code_search")
 LABEL_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # always use .fullmatch: "$" would accept a trailing newline
 MAX_RESET = 10 ** 11  # seconds; a reset time later than this is not a real Unix time
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # never printed from a header: it could drive the terminal
 
 
 # ---------- GitHub's rate_limit answer ----------
@@ -111,7 +114,8 @@ class _Guarded(click.Group):
     def invoke(self, ctx: click.Context):
         try:
             result = super().invoke(ctx)
-            sys.stdout.flush()  # a closed pipe shows here when the output was small
+            if sys.stdout is not None:  # None when stdout was closed (`>&-`)
+                sys.stdout.flush()  # a closed pipe shows here when the output was small
             return result
         except BrokenPipeError:
             _reader_left()
@@ -128,23 +132,28 @@ class _Guarded(click.Group):
 
 def _global_options(command):
     """--as and --budget after the command too; a value given there wins over one given before it."""
-    command = click.option("--budget", type=int, metavar="N", help="Max GitHub calls for --as LABEL in 24 h.")(command)
+    command = click.option("--budget", type=int, metavar="N",
+                           help="Cooperative cap on GitHub calls for --as LABEL in 24 h.")(command)
     return click.option("--as", "label", metavar="LABEL", help="Tag calls in the log (default: TOLLBOOTH_AS).")(command)
 
 
 @click.group(cls=_Guarded, context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--as", "label", envvar="TOLLBOOTH_AS", metavar="LABEL",
               help="Tag calls in the log (default: TOLLBOOTH_AS, else anon).")
-@click.option("--budget", type=int, metavar="N", help="Max GitHub calls for --as LABEL in 24 h.")
+@click.option("--budget", type=int, metavar="N", help="Cooperative cap on GitHub calls for --as LABEL in 24 h.")
 @click.pass_context
 def cli(ctx: click.Context, label: str | None, budget: int | None) -> None:
     """gh-tollbooth: one polite, shared, read-only request stream to GitHub for every agent on a machine.
 
     It talks to the GitHub API directly, with the login `gh` already has (or GH_TOKEN).
 
+    --budget caps the GitHub calls LABEL makes in 24 h. It is cooperative: it holds while every command
+    passes it, and can't stop an agent that drops it, picks another label or calls GitHub another way.
+
     \b
-    Exit codes: 0 ok, 1 no token, no answer from GitHub or no state folder, 2 usage,
-    76 busy (wait a minute and retry once).
+    Exit codes: 0 ok; 1 no token, no answer from GitHub, an HTTP error answer or no state folder;
+    2 usage or a request gh-tollbooth refuses; 3 GitHub gave up on the request; 4 budget used up;
+    75 GitHub rate limit (stop and report the time); 76 busy or out of time (retry once later).
     """
     ctx.obj = {"label": label, "budget": budget}
 
@@ -180,6 +189,55 @@ def status(ctx: click.Context, label: str | None, budget: int | None, last: int)
     for c in recent[-last:] if last else []:
         click.echo(f"  {_clock(c.at)}  {c.label:<16} {c.bucket:<12} http={c.status:<3} {c.secs:>5.1f}s  "
                    f"{c.summary[:70]}")
+
+
+@cli.command(context_settings={"allow_interspersed_args": False})
+@_global_options
+@click.option("--no-cache", is_flag=True, help="Accepted and ignored: gh-tollbooth doesn't cache.")
+@click.argument("gh_args", nargs=-1, type=click.UNPROCESSED, metavar="-- api ENDPOINT [OPTIONS]")
+@click.pass_context
+def call(ctx: click.Context, label: str | None, budget: int | None, no_cache: bool, gh_args: tuple[str, ...]) -> None:
+    """One read-only GitHub API request, throttled. GitHub's answer goes to stdout as it is.
+
+    \b
+    It takes `gh api`'s form: one endpoint (or graphql) with -X GET|HEAD, -f/-F key=value,
+    -H 'Accept: ...', -i and --silent. Pipe the output to jq to pick fields.
+    --as and --budget go before `--`. An HTTP error answer is printed too, and exits 1.
+    """
+    caller = _start(ctx, label, budget)
+    req = parse_call(list(gh_args))
+    if sys.stdout is None and not req.silent:  # `>&-`: the call would be charged and its answer lost
+        raise core.TollboothError("stdout is closed, so GitHub's answer would be lost: redirect it, or pass --silent",
+                                  core.EX_USAGE)
+    try:
+        resp = caller.fetch(req.method, req.path, accept=req.accept, json_body=req.json_body)
+    except ValueError as e:  # the guard let through something tollbooth_http refuses
+        raise core.TollboothError(f"refused: {e}", core.EX_USAGE) from None
+    except tollbooth_throttle.StoppedOnAnswer as e:  # a 502/504 or a rate limit: GitHub's answer, then the exit
+        _write_answer(e.answer, req)
+        raise
+    _write_answer(resp, req)
+    if not 200 <= resp.status < 300:
+        _fail(ctx, f"HTTP {resp.status} {REASONS.get(resp.status, '')}".rstrip(), core.EX_FAIL)
+
+
+def _write_answer(resp: http.Response, req: CallRequest) -> None:
+    """GitHub's answer on stdout, byte for byte: with -i the status line and headers first; with --silent nothing."""
+    if req.silent:
+        return
+    sys.stdout.flush()  # anything printed as text goes first
+    out = sys.stdout.buffer
+    if req.include:
+        head = [f"HTTP/1.1 {resp.status} {REASONS.get(resp.status, '')}".rstrip()]
+        head += [f"{_header_name(k)}: {v}" for k, v in resp.headers.items()]
+        out.write("".join(CONTROL_RE.sub("?", line) + "\n" for line in head).encode("utf-8", "replace") + b"\n")
+    out.write(resp.body)
+    out.flush()
+
+
+def _header_name(name: str) -> str:
+    """x-ratelimit-remaining -> X-Ratelimit-Remaining, the way gh prints header names."""
+    return "-".join(part.capitalize() for part in name.split("-"))
 
 
 def main(argv: list[str] | None = None) -> int:
