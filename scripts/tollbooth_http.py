@@ -7,8 +7,10 @@ The environment is trusted, not checked: whoever sets HTTPS_PROXY or SSL_CERT_FI
 request, token included. See "Trust boundary" in gh-tollbooth.
 
 classify() decides about rate limits from the status code and GitHub's rate-limit headers, never
-from error text, which can echo a query. The one body field it reads is a 403's
-`documentation_url`, which GitHub sets: a secondary limit can arrive without those headers.
+from error text, which can echo a query. It reads the body in two narrow cases: a 403's
+`documentation_url`, which GitHub sets (a secondary limit can arrive without those headers), and
+whether a GraphQL 200 with nothing left has a non-empty `errors` list (how GitHub reports a spent
+GraphQL limit), never what the errors say.
 
 The token (GH_TOKEN, GITHUB_TOKEN or `gh auth token`) goes in the Authorization header only.
 """
@@ -245,6 +247,21 @@ def _int(value) -> Optional[int]:
     return n if abs(n) <= MAX_HEADER_NUMBER else None
 
 
+def _graphql_spent(path: str, resp: Response) -> bool:
+    """True for a GraphQL 200 with errors and no requests left: how GitHub reports a spent GraphQL limit.
+
+    Only whether `errors` is a non-empty list is looked at, never what the errors say.
+    """
+    if path != "graphql" or resp.status != 200 or resp.headers.get("x-ratelimit-remaining") != "0":
+        return False
+    try:
+        doc = json.loads(resp.body)
+    except (ValueError, RecursionError):
+        return False
+    errors = doc.get("errors") if isinstance(doc, dict) else None
+    return isinstance(errors, list) and len(errors) > 0
+
+
 def _links_secondary_limit_docs(body: bytes) -> bool:
     """True if a 403's body is an error object whose documentation_url is GitHub's secondary-limit page.
 
@@ -260,14 +277,14 @@ def _links_secondary_limit_docs(body: bytes) -> bool:
     return isinstance(url, str) and SECONDARY_DOC_RE.fullmatch(url) is not None
 
 
-def classify(resp: Response, wall_now: float, failed: bool = False) -> Verdict:
+def classify(resp: Response, wall_now: float, path: str = "") -> Verdict:
     """Decide from the HTTP status and GitHub's headers, plus one GitHub-set field of a 403's body.
 
-    `failed` says a 200 answer carried GraphQL errors (GitHub reports a spent GraphQL limit that way).
+    `path` is the request's path: a GraphQL 200 with errors and nothing left is a spent GraphQL limit.
 
     - 502/504                                         -> heavy
     - 403/429 with Retry-After                        -> secondary, wait Retry-After
-    - 403/429, or a failed 200, with X-RateLimit-Remaining 0 -> primary until the reset time
+    - 403/429, or a GraphQL 200 with errors, with X-RateLimit-Remaining 0 -> primary until the reset
     - 429 without those headers                       -> secondary (the caller picks the backoff)
     - 403 without them whose documentation_url is the secondary-limit page -> secondary (same)
     - anything else (permission 403, 404, GraphQL NOT_FOUND, ...) -> None: not a rate limit
@@ -276,7 +293,7 @@ def classify(resp: Response, wall_now: float, failed: bool = False) -> Verdict:
     bucket = h.get("x-ratelimit-resource")
     if resp.status in (502, 504):
         return Verdict("heavy")
-    if not (resp.status in (403, 429) or (resp.status == 200 and failed)):
+    if not (resp.status in (403, 429) or _graphql_spent(path, resp)):
         return Verdict()
     retry = _int(h.get("retry-after"))
     if retry is not None and resp.status in (403, 429):

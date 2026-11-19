@@ -29,7 +29,8 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tollbooth_core as core  # noqa: E402
 import tollbooth_http as http  # noqa: E402
-from tollbooth_core import EX_FAIL, EX_USAGE, TollboothError, Throttle, clock_in, eprint  # noqa: E402
+from tollbooth_core import EX_FAIL, EX_USAGE, TollboothError, clock_in, eprint  # noqa: E402
+from tollbooth_throttle import Throttle  # noqa: E402
 
 BUCKETS = ("graphql", "core", "search", "code_search")
 
@@ -57,7 +58,7 @@ def cmd_status(ctx, a) -> int:
     print("bucket        remaining/limit  resets")
     for (b, _), line in zip(rows, lines):
         left = ctx.throttle.blocked_for(b)
-        print(line + (f"  BLOCKED until {clock_in(left)}" if left > 0 else ""))
+        print(line + (f"  BLOCKED until {clock_in(left, ctx.throttle.clock)}" if left > 0 else ""))
     hour_ago = (dt.datetime.now() - dt.timedelta(hours=1)).isoformat(timespec="seconds")
     recent = [e for e in ctx.throttle.entries() if len(e) >= 7 and e[0] >= hour_ago]
     counts: dict = {}

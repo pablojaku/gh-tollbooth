@@ -9,17 +9,16 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from _fixtures import SCRIPTS, answer, http, load_cli
+from _fixtures import SCRIPTS, TOKEN, answer, http, load_cli, logged, recorded
 
 cli = load_cli("tollbooth_cli")
 core = cli.core
+import tollbooth_throttle as throttling  # noqa: E402  # pyright: ignore[reportMissingImports]
 
-TOKEN = "ghx_FAKEtokenFAKEtoken"
 RESET = 1_800_000_600
 RATE_LIMIT = json.dumps({"resources": {
     "core": {"limit": 5000, "remaining": 4990, "reset": RESET},
@@ -85,20 +84,20 @@ class Status(CliCase):
     def test_is_one_free_request_outside_the_throttle(self):
         self.main(["--as", "lab", "status"])
         self.send.assert_called_once_with("GET", "rate_limit", TOKEN, timeout=30)
-        throttle = core.Throttle(self.state)
+        throttle = throttling.Throttle(self.state)
         self.assertEqual((throttle.used("lab"), throttle.entries(), throttle.state()), (0, [], {}))
 
     def test_flags_a_bucket_another_agent_blocked(self):
-        core.Throttle(self.state).mark("search", {"search": time.time() + 120})
+        recorded(throttling.Throttle(self.state), "search", {"search": 120})
         _, out, _ = self.main(["status"])
         flagged = [ln.split()[0] for ln in out.splitlines() if "BLOCKED until" in ln]
         self.assertEqual(flagged, ["search"])
 
     def test_lists_recent_calls_by_label(self):
-        throttle = core.Throttle(self.state)
+        throttle = throttling.Throttle(self.state)
         for i in range(3):
-            throttle.log("scout", "search", 200, 0.4, f"GET search/repositories?q=term{i}")
-        throttle.log("other", "graphql", 502, 9.9, "POST graphql")
+            logged(throttle, "scout", "search", 200, 0.4, f"GET search/repositories?q=term{i}")
+        logged(throttle, "other", "graphql", 502, 9.9, "POST graphql")
         _, out, _ = self.main(["status", "--last", "2"])
         self.assertIn("calls in the last hour: 4", out)
         self.assertRegex(out, r"3\s+search\s+scout")
@@ -107,9 +106,9 @@ class Status(CliCase):
         self.assertNotIn("term0", out)  # --last 2 shows the two newest calls
 
     def test_last_zero_lists_no_calls_and_a_negative_count_is_refused(self):
-        throttle = core.Throttle(self.state)
+        throttle = throttling.Throttle(self.state)
         for i in range(3):
-            throttle.log("scout", "search", 200, 0.4, f"GET search/repositories?q=term{i}")
+            logged(throttle, "scout", "search", 200, 0.4, f"GET search/repositories?q=term{i}")
         _, out, _ = self.main(["status", "--last", "0"])
         self.assertIn("calls in the last hour: 3", out)
         self.assertNotIn("term", out)
@@ -125,7 +124,7 @@ class Status(CliCase):
         self.assertNotIn("BLOCKED", out)
 
     def test_logged_text_this_locale_cannot_print_is_shown_with_question_marks(self):
-        core.Throttle(self.state).log("scout", "core", 200, 0.1, "GET caf\u00e9 \u2603")
+        logged(throttling.Throttle(self.state), "scout", "core", 200, 0.1, "GET caf\u00e9 \u2603")
         raw = io.BytesIO()
         out = io.TextIOWrapper(raw, encoding="latin-1")  # strict, as under LANG=en_US.ISO8859-1
         with mock.patch.object(http, "send", return_value=answer(200, body=RATE_LIMIT)), \
@@ -137,7 +136,7 @@ class Status(CliCase):
         self.assertIn(b"GET caf\xe9 ?", raw.getvalue())
 
     def test_control_characters_are_never_printed(self):
-        core.Throttle(self.state).log("scout", "core", 200, 0.1, "GET q=\x1b[2J\x07")
+        logged(throttling.Throttle(self.state), "scout", "core", 200, 0.1, "GET q=\x1b[2J\x07")
         doc = json.loads(RATE_LIMIT)
         doc["resources"]["core"].update(limit="\x1b[31m5000", remaining="\x1b]0;x\x07")
         code, out, _ = self.main(["status"], send=answer(200, body=json.dumps(doc).encode()))
@@ -256,6 +255,25 @@ class Isolation(unittest.TestCase):
             p = subprocess.run([str(SCRIPTS / "gh-tollbooth"), "--help"], capture_output=True, text=True, env=env, cwd=d)
             self.assertEqual((p.returncode, marker.exists()), (0, False), p.stderr[-300:])
             self.assertIn("gh-tollbooth status", p.stdout)
+
+
+class Deadline(unittest.TestCase):
+    def test_a_value_that_is_not_whole_seconds_is_ignored_with_one_line(self):
+        for bad in ("150.5", "soon", "0", "-5", "9" * 30):
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"TOLLBOOTH_DEADLINE": bad}), contextlib.redirect_stderr(err):
+                self.assertEqual(core.env_seconds("TOLLBOOTH_DEADLINE", 100), 100, bad)
+            self.assertEqual(len(err.getvalue().splitlines()), 1, bad)
+            self.assertIn("TOLLBOOTH_DEADLINE", err.getvalue())
+
+    def test_a_whole_number_is_used_and_an_unset_value_is_the_default(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with mock.patch.dict(os.environ, {"TOLLBOOTH_DEADLINE": "45"}):
+                self.assertEqual(core.env_seconds("TOLLBOOTH_DEADLINE", 100), 45)
+            with mock.patch.dict(os.environ, {"TOLLBOOTH_DEADLINE": ""}):
+                self.assertEqual(core.env_seconds("TOLLBOOTH_DEADLINE", 100), 100)
+        self.assertEqual(err.getvalue(), "")
 
 
 if __name__ == "__main__":

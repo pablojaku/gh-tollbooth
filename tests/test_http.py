@@ -15,9 +15,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, cast
 from unittest import mock
 
-from _fixtures import WALL0, answer, http, primary, secondary
+from _fixtures import TOKEN, WALL0, answer, http, primary, secondary
 
-TOKEN = "ghx_FAKEtokenFAKEtoken"
 # documentation_url values GitHub has sent with "You have exceeded a secondary rate limit" (2022 and 2024 forms)
 SECONDARY_DOCS = (
     "https://docs.github.com/free-pro-team@latest/rest/overview/rate-limits-for-the-rest-api#about-secondary-rate-limits",
@@ -373,19 +372,27 @@ class Classify(unittest.TestCase):
         self.assertIsNone(http.classify(answer(200, ok_headers), now).kind)
         self.assertIsNone(http.classify(answer(301), now).kind)
 
-    def test_a_graphql_200_is_a_limit_only_when_it_failed_with_nothing_left(self):
+    def test_a_graphql_200_is_a_limit_only_when_it_has_errors_and_nothing_left(self):
         now = WALL0
-        spent = primary(now + 20, status=200, resource="graphql")
-        self.assertIsNone(http.classify(spent, now).kind)  # the last allowed call still succeeded
-        self.assertEqual(http.classify(spent, now, failed=True).kind, "primary")
-        left = answer(200, {"X-RateLimit-Remaining": "12", "X-RateLimit-Reset": int(now + 900)})
-        self.assertIsNone(http.classify(left, now, failed=True).kind)  # an ordinary GraphQL error
+        spent = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": int(now + 20), "X-RateLimit-Resource": "graphql"}
+        failed = answer(200, spent, b'{"errors": [{"type": "RATE_LIMITED"}]}')
+        v = http.classify(failed, now, "graphql")
+        self.assertEqual((v.kind, v.bucket), ("primary", "graphql"))
+        self.assertAlmostEqual(v.delay, 22, delta=0.01)
+        self.assertIsNone(http.classify(failed, now, "repos/o/r").kind)  # only a GraphQL answer means that
+        self.assertIsNone(http.classify(failed, now).kind)
+        left = dict(spent, **{"X-RateLimit-Remaining": "12"})
+        for headers, body in ((spent, b'{"data": {"viewer": null}}'),          # the last allowed call worked
+                              (spent, b'{"errors": []}'), (spent, b"[" * 100_000), (spent, b"not json"),
+                              (spent, b'["errors"]'),
+                              (left, b'{"errors": [{"type": "NOT_FOUND"}]}')):  # an ordinary GraphQL error
+            self.assertIsNone(http.classify(answer(200, headers, body), now, "graphql").kind, body[:40])
 
     def test_text_never_decides(self):
         body = b'{"message": "API rate limit exceeded for user ID 1. You have exceeded a secondary rate limit"}'
         for status in (200, 403, 404, 422):
             r = answer(status, {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": int(WALL0 + 900)}, body)
-            self.assertIsNone(http.classify(r, WALL0, failed=True).kind, status)
+            self.assertIsNone(http.classify(r, WALL0, "graphql").kind, status)
 
     def test_a_403_that_links_the_secondary_limit_docs_is_a_secondary_limit(self):
         # GitHub can send a secondary limit with no Retry-After and with requests remaining. The only
@@ -405,7 +412,7 @@ class Classify(unittest.TestCase):
         doc = SECONDARY_DOCS[0]
         left = {"X-RateLimit-Remaining": "4000", "X-RateLimit-Reset": int(WALL0 + 900)}
         for status in (200, 404, 422, 500):  # only a 403 is looked at
-            self.assertIsNone(http.classify(answer(status, left, error_body(doc)), WALL0, failed=True).kind, status)
+            self.assertIsNone(http.classify(answer(status, left, error_body(doc)), WALL0, "graphql").kind, status)
         not_it = [
             json.dumps({"message": f"see {doc}", "documentation_url": "https://docs.github.com/rest"}),  # text only
             json.dumps({"errors": [{"documentation_url": doc}]}),                 # not the top-level field
