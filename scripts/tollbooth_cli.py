@@ -102,7 +102,7 @@ def _reader_left() -> None:
 
 
 def _fail(ctx: click.Context, message: str, code: int) -> NoReturn:
-    click.echo(f"gh-tollbooth: {message}", err=True)
+    click.echo(f"gh-tollbooth: {printable(message)}", err=True)
     ctx.exit(code)
 
 

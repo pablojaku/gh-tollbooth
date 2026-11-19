@@ -202,7 +202,8 @@ def parse_call(args: list[str]) -> CallRequest:
         if not is_utf8(a):
             _refuse(f"arguments must be valid UTF-8 text (in {a[:40]!r})")
         if has_hidden(a):
-            _refuse(f"control or invisible characters are not allowed in gh-tollbooth arguments (in {a[:40]!r})")
+            _refuse("hidden characters (control, format or bidi characters, variation selectors) are not allowed "
+                    f"in gh-tollbooth arguments (in {a[:40]!r})")
     if args[0] != "api":
         _refuse(f"call makes GitHub API requests only, not `gh {args[0][:20]}`. Use the API form, "
                 "e.g. gh-tollbooth call -- api repos/OWNER/REPO/pulls or api search/code -f q='...'")

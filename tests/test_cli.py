@@ -18,7 +18,7 @@ from unittest import mock
 import tollbooth_cli as cli
 from click.testing import CliRunner
 
-from _fixtures import SCRIPTS, answer, settings
+from _fixtures import SCRIPTS, answer, primary, settings
 
 core, http, throttling = cli.core, cli.http, cli.tollbooth_throttle
 TOKEN = "ghx_FAKEtokenFAKEtoken"
@@ -230,6 +230,22 @@ class Call(CliCase):
         code, out, _ = self.call(["call", "--", "api", "-i", "rate_limit"], send=reply)
         self.assertEqual((code, out), (0, b"HTTP/1.1 200 OK\nX-Ratelimit-Remaining: 4999\n"
                                           b"Content-Type: application/json\nX-Odd: a?b\n\n{}"))
+
+    def test_include_marks_every_hidden_character_in_a_header(self):
+        reply = answer(200, {"X-Odd": "a\u202eb\u2764\ufe0fc"}, b"{}")
+        _, out, _ = self.call(["call", "--", "api", "-i", "rate_limit"], send=reply)
+        self.assertIn("X-Odd: a?b\u2764?c\n".encode(), out)
+
+    def test_no_hidden_character_reaches_stderr(self):
+        code, _, err = self.call(["call", "--", "api", "search/repositories", "-f", "q=\u2764\ufe0f"])
+        self.assertEqual(code, core.EX_USAGE)
+        self.assertIn("hidden characters", err)
+        self.assertNotIn("\ufe0f", err)  # the argument is quoted back, the selector as "?"
+        code, _, err = self.call(["call", "--", "api", "repos/o/r"],
+                                 send=primary(time.time() + 3000, resource="evil\x1b]0;x\x07"))
+        self.assertEqual(code, core.EX_LIMITED)
+        self.assertIn("an untracked resource is rate-limited until", err)
+        self.assertNotIn("\x1b", err)
 
     def test_silent_prints_nothing_and_still_exits_by_status(self):
         self.assertEqual(self.call(["call", "--", "api", "--silent", "repos/o/r"])[:2], (0, b""))

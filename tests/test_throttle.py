@@ -6,6 +6,7 @@ Run: uv run pytest
 """
 import errno
 import fcntl
+import logging
 import os
 import shutil
 import subprocess
@@ -62,6 +63,10 @@ class Settings(unittest.TestCase):
         with self.assertLogs("gh-tollbooth", "WARNING") as logs:
             self.assertEqual(self.settings(max_wait="soon").max_wait, 60)
         self.assertIn("TOLLBOOTH_MAX_WAIT", logs.output[0])
+
+    def test_every_notice_is_one_printable_line(self):
+        record = logging.makeLogRecord({"msg": "waiting for a\u202eb\nc\ufe0f\x1b"})
+        self.assertEqual(core.log.handlers[0].format(record), "gh-tollbooth: waiting for a?b?c??")
 
     def test_the_line_on_stderr(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("TOLLBOOTH_")}

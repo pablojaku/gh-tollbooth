@@ -20,10 +20,20 @@ from pydantic import (AfterValidator, BeforeValidator, Field, ValidationError, V
                       ValidatorFunctionWrapHandler, WrapValidator)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from tollbooth_text import printable
+
+
+class _OneLine(logging.Formatter):
+    """A notice as one line on stderr: hidden characters (newlines too) as \"?\"."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return printable(super().format(record))
+
+
 log = logging.getLogger("gh-tollbooth")
 if not log.handlers:  # each notice is one "gh-tollbooth: ..." line on stderr
     _stderr = logging.StreamHandler()
-    _stderr.setFormatter(logging.Formatter("gh-tollbooth: %(message)s"))
+    _stderr.setFormatter(_OneLine("gh-tollbooth: %(message)s"))
     log.addHandler(_stderr)
     log.setLevel(logging.INFO)
     log.propagate = False

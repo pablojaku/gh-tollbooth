@@ -211,12 +211,16 @@ class Attacks(GuardCase):
                      ["api", "repos/o/r\udcff"], ["api", "repos/o/r", "-H", "Accept: \udcff"]):
             self.assertRefused(args, "UTF-8")
 
-    def test_invisible_and_control_characters(self):
+    def test_hidden_characters(self):
         hidden = 'mutation M { addStar(input: {starrableId: "x"}) { clientMutationId } }'
-        for sep in ("\r", " ", "​", "\x85", "﻿", "\x0b", "\x00"):
+        for sep in ("\r", "\u2028", "\u200b", "\x85", "\ufeff", "\x0b", "\x00", "\u061c", "\U000e0041", "\ufe0f"):
             self.assertRefused(["api", "graphql", "-f", f"query={{viewer{{login}}}} #{sep} {hidden}",
-                                "-f", "operationName=M"], "invisible")
+                                "-f", "operationName=M"], "hidden characters")
 
+    def test_a_hidden_character_in_any_argument(self):
+        for args in (["api", "search/repositories", "-f", "q=\u2764\ufe0f"], ["api", "repos/o/r\u00ad"],
+                     ["api", "repos/o/r", "-H", "Accept: \u202e"]):
+            self.assertRefused(args, "hidden characters")
 
 if __name__ == "__main__":
     unittest.main()

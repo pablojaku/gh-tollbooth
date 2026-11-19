@@ -131,6 +131,15 @@ class Limits(LoopCase):
         self.assertIn("dependency_sbom", str(cm.exception))
         self.assertEqual(self.throttle.blocked_for("core"), 0.0)
 
+    def test_a_resource_name_that_isnt_a_plain_name_is_not_repeated(self):
+        # GitHub's header text, or a proxy's, never reaches the message: it could drive the terminal
+        self.answers = [primary(self.clock.now() + 20, resource="evil\x1b]0;x\x07")]
+        with self.assertRaises(core.TollboothError) as cm:
+            self.fetch("GET", "repos/o/r")
+        self.assertEqual(cm.exception.code, core.EX_LIMITED)
+        self.assertTrue(str(cm.exception).startswith("an untracked resource is rate-limited until"), cm.exception)
+        self.assertEqual(self.throttle.blocked_for("core"), 0.0)
+
     def test_a_limit_that_ends_the_call_carries_githubs_answer(self):
         far = primary(self.clock.now() + 3000)  # longer than TOLLBOOTH_MAX_WAIT
         self.answers = [far]

@@ -21,6 +21,7 @@ from typing import Any
 import tollbooth_http as http
 import tollbooth_throttle as throttling
 from tollbooth_core import EX_HEAVY, TollboothError
+from tollbooth_text import RESOURCE_RE
 from tollbooth_throttle import StoppedOnAnswer
 
 CALL_TIMEOUT = 90          # seconds one request may take, at most
@@ -75,11 +76,13 @@ def _limit(verdict: http.Verdict, bucket: str) -> throttling.Limit | None:
     """GitHub's verdict as the turn's Limit, or None if it isn't a rate limit.
 
     A primary limit stops the bucket GitHub names (the request's own, if it names none), but only if
-    the throttle tracks that bucket; a secondary limit stops every bucket.
+    the throttle tracks that bucket; a secondary limit stops every bucket. A message repeats GitHub's
+    name only if it is a plain name: header text could drive the terminal.
     """
     if verdict.kind == "primary":
         named = verdict.bucket or bucket
-        return throttling.Limit(named, (named,) if named in throttling.BUCKETS else (), verdict.delay)
+        what = named if RESOURCE_RE.fullmatch(named) else "an untracked resource"
+        return throttling.Limit(what, (named,) if named in throttling.BUCKETS else (), verdict.delay)
     if verdict.kind == "secondary":
         return throttling.Limit("every bucket", throttling.BUCKETS, verdict.delay)
     return None

@@ -75,7 +75,7 @@ class Call:
     bucket: str
     status: int     # HTTP status, 0 if GitHub gave no answer
     secs: float
-    summary: str    # what was asked, cut to LOG_SUMMARY characters, control characters as "?"
+    summary: str    # what was asked, cut to LOG_SUMMARY characters, hidden characters as "?"
 
 
 @dataclass(frozen=True)
@@ -428,7 +428,7 @@ class Throttle:
             pass
 
     def entries(self, since: float = 0.0) -> list[Call]:
-        """Calls logged at or after `since` (wall-clock time), oldest first, control characters as "?"."""
+        """Calls logged at or after `since` (wall-clock time), oldest first, hidden characters as "?"."""
         rows = self._db(lambda con: con.execute("SELECT at, label, pid, bucket, status, secs, summary FROM call "
                                                 "WHERE at >= ? ORDER BY id", (since,)).fetchall(), write=False)
         return [Call(at, printable(label), pid, printable(bucket), status, secs, printable(summary))
