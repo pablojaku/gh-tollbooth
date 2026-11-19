@@ -18,7 +18,7 @@ from unittest import mock
 import tollbooth_cli as cli
 from click.testing import CliRunner
 
-from _fixtures import SCRIPTS, answer
+from _fixtures import SCRIPTS, answer, settings
 
 core, http, throttling = cli.core, cli.http, cli.tollbooth_throttle
 TOKEN = "ghx_FAKEtokenFAKEtoken"
@@ -63,7 +63,7 @@ class CliCase(unittest.TestCase):
         self.use_state_dir(self.state)
 
     def use_state_dir(self, folder: Path):
-        p = mock.patch.object(core, "SETTINGS", core.Settings(state_dir=folder, deadline=100))
+        p = mock.patch.object(core, "SETTINGS", settings(state_dir=folder, deadline=100))
         p.start()
         self.addCleanup(p.stop)
 
@@ -79,6 +79,15 @@ class CliCase(unittest.TestCase):
             raise result.exception
         self.assertNotIn(TOKEN, result.stdout + result.stderr)
         return result.exit_code, result.stdout, result.stderr
+
+
+class TestSettings(CliCase):
+    """A CLI test runs with the settings it sets and the defaults, never this machine's TOLLBOOTH_* values."""
+
+    def test_this_machines_values_dont_leak_in(self):
+        with mock.patch.dict(os.environ, {"TOLLBOOTH_MAX_WAIT": "5", "TOLLBOOTH_DEADLINE": "7"}):
+            self.use_state_dir(self.state)
+        self.assertEqual((core.SETTINGS.max_wait, core.SETTINGS.deadline), (core.DEFAULT_MAX_WAIT, 100))
 
 
 class Status(CliCase):

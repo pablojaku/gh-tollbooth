@@ -14,7 +14,7 @@ import tollbooth_core as core
 import tollbooth_http as http
 import tollbooth_loop as loop
 import tollbooth_throttle as throttling
-from _fixtures import FakeClock, answer, primary, secondary
+from _fixtures import FakeClock, answer, primary, secondary, settings
 
 TOKEN = "ghx_FAKEtokenFAKEtoken"
 OK = answer(200, body=b'{"ok": 1}')
@@ -34,7 +34,7 @@ class LoopCase(unittest.TestCase):
         self.throttle = throttling.Throttle(self.dir, self.clock)
         self.caller = loop.Caller("lab", None, self.throttle)
         self.answers = []
-        self.patch(core, "SETTINGS", core.Settings(deadline=100, max_wait=60))
+        self.patch(core, "SETTINGS", settings(deadline=100, max_wait=60))
         self.send = self.patch(http, "send", mock.Mock(side_effect=lambda *a, **k: self.next_answer()))
         self.token = self.patch(http, "token", mock.Mock(return_value=TOKEN))
 
@@ -73,7 +73,7 @@ class Answers(LoopCase):
     def test_the_request_gets_the_time_left_at_most_90_s(self):
         self.fetch()
         self.assertEqual(self.send.call_args.kwargs["timeout"], 90)
-        self.patch(core, "SETTINGS", core.Settings(deadline=50, max_wait=60))
+        self.patch(core, "SETTINGS", settings(deadline=50, max_wait=60))
         self.fetch()
         self.assertEqual(self.send.call_args.kwargs["timeout"], 49.5)  # 50 s, less core's 0.5 s call gap
 

@@ -19,6 +19,7 @@ from unittest import mock
 
 import tollbooth_core as core
 import tollbooth_throttle as throttling
+from _fixtures import clean_env
 from filelock import FileLock, Timeout
 
 
@@ -27,9 +28,7 @@ class Settings(unittest.TestCase):
 
     def settings(self, **env):
         """Settings read from exactly `env`: the TOLLBOOTH_* variables of this machine don't leak in."""
-        clean = {k: v for k, v in os.environ.items() if not k.startswith("TOLLBOOTH_")}
-        clean.update({f"TOLLBOOTH_{k.upper()}": v for k, v in env.items()})
-        with mock.patch.dict(os.environ, clean, clear=True):
+        with clean_env(**env):
             return core.Settings()
 
     def test_the_state_dir_is_used_only_if_it_is_an_absolute_path(self):

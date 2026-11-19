@@ -10,7 +10,7 @@ from unittest import mock
 
 import tollbooth_core as core
 import tollbooth_throttle as throttling
-from _fixtures import FakeClock
+from _fixtures import FakeClock, settings
 from filelock import FileLock, Timeout
 
 
@@ -19,7 +19,7 @@ class ClockCase(unittest.TestCase):
 
     def setUp(self):
         self.clock = FakeClock()
-        p = mock.patch.object(core, "SETTINGS", core.Settings(deadline=100, max_wait=60))
+        p = mock.patch.object(core, "SETTINGS", settings(deadline=100, max_wait=60))
         p.start()
         self.addCleanup(p.stop)
 
