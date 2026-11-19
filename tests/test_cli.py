@@ -96,7 +96,7 @@ class Status(CliCase):
         self.assertEqual((throttle.used("lab"), throttle.entries()), (0, []))
 
     def test_flags_a_bucket_another_agent_blocked(self):
-        throttling.Throttle(self.state).mark("search", {"search": time.time() + 120})
+        throttling.Throttle(self.state)._mark("search", {"search": time.time() + 120})
         _, out, _ = self.main(["status"])
         flagged = [ln.split()[0] for ln in out.splitlines() if "BLOCKED until" in ln]
         self.assertEqual(flagged, ["search"])
@@ -104,8 +104,8 @@ class Status(CliCase):
     def test_lists_recent_calls_by_label(self):
         throttle = throttling.Throttle(self.state)
         for i in range(3):
-            throttle.log("scout", "search", 200, 0.4, f"GET search/repositories?q=term{i}")
-        throttle.log("other", "graphql", 502, 9.9, "POST graphql")
+            throttle._log("scout", "search", 200, 0.4, f"GET search/repositories?q=term{i}")
+        throttle._log("other", "graphql", 502, 9.9, "POST graphql")
         _, out, _ = self.main(["status", "--last", "2"])
         self.assertIn("calls in the last hour: 4", out)
         self.assertRegex(out, r"3\s+search\s+scout")
@@ -116,7 +116,7 @@ class Status(CliCase):
     def test_last_zero_lists_no_calls_and_a_negative_count_is_refused(self):
         throttle = throttling.Throttle(self.state)
         for i in range(3):
-            throttle.log("scout", "search", 200, 0.4, f"GET search/repositories?q=term{i}")
+            throttle._log("scout", "search", 200, 0.4, f"GET search/repositories?q=term{i}")
         _, out, _ = self.main(["status", "--last", "0"])
         self.assertIn("calls in the last hour: 3", out)
         self.assertNotIn("term", out)
@@ -124,7 +124,7 @@ class Status(CliCase):
         self.assertEqual(code, core.EX_USAGE)
 
     def test_control_characters_are_never_printed(self):
-        throttling.Throttle(self.state).log("scout", "core", 200, 0.1, "GET q=\x1b[2J\x07")
+        throttling.Throttle(self.state)._log("scout", "core", 200, 0.1, "GET q=\x1b[2J\x07")
         doc = json.loads(RATE_LIMIT)
         doc["resources"]["core"].update(limit="\x1b[31m5000", remaining="\x1b]0;x\x07")
         code, out, _ = self.main(["status"], send=answer(200, body=json.dumps(doc).encode()))
@@ -157,7 +157,7 @@ class Status(CliCase):
         self.assertIn("no answer in 30 s", err)
 
     def test_logged_text_this_locale_cannot_print_is_shown_with_question_marks(self):
-        throttling.Throttle(self.state).log("scout", "core", 200, 0.1, "GET café ☃")
+        throttling.Throttle(self.state)._log("scout", "core", 200, 0.1, "GET café ☃")
         raw = io.BytesIO()
         out = io.TextIOWrapper(raw, encoding="latin-1")  # strict, as under LANG=en_US.ISO8859-1
         with mock.patch.object(http, "send", return_value=answer(200, body=RATE_LIMIT)), \

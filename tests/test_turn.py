@@ -1,14 +1,17 @@
-"""Turn tests: one call's time budget (Deadline).
+"""Turn tests: one call's time budget (Deadline) and one turn through the throttle (Throttle.turn).
 
 Mock-first: a FakeClock stands in for both clocks, so no test waits.
 Run: uv run pytest
 """
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import tollbooth_core as core
 import tollbooth_throttle as throttling
 from _fixtures import FakeClock
+from filelock import FileLock, Timeout
 
 
 class ClockCase(unittest.TestCase):
@@ -70,6 +73,133 @@ class Deadline(ClockCase):
         self.assertEqual(cm.exception.code, core.EX_LIMITED)
         d.wait(25, limit="core")  # this one fits: 15 s are left after it
         self.assertEqual(self.clock.sleeps, [60, 25])
+
+
+class TurnCase(ClockCase):
+    """A Throttle on a temporary state folder, with the fake clock; `sent` records each send's time left."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name) / "state"
+        self.throttle = throttling.Throttle(self.dir, self.clock)
+        self.sent = []
+
+    def other_agent(self):
+        return throttling.Throttle(self.dir, self.clock)
+
+    def send(self, left):
+        self.sent.append(round(left, 3))
+        return "answer", 200
+
+    def turn(self, bucket="core", budget=None, deadline=None, send=None):
+        deadline = deadline or throttling.Deadline(self.clock)
+        return self.throttle.turn("lab", budget, bucket, deadline, "GET x", send or self.send)
+
+    def lock_is_free(self):
+        probe = FileLock(self.throttle.lock_path, thread_local=False)
+        try:
+            probe.acquire(blocking=False)
+        except Timeout:
+            return False
+        probe.release()
+        return True
+
+
+class Turn(TurnCase):
+    def test_one_turn_sends_once_holding_the_lock_and_records_it(self):
+        held = []
+
+        def send(left):
+            held.append(not self.lock_is_free())
+            return "answer", 200
+        self.assertEqual(self.turn(send=send), "answer")
+        self.assertEqual(held, [True])
+        self.assertTrue(self.lock_is_free())
+        (call,) = self.throttle.entries()
+        self.assertEqual((call.label, call.bucket, call.status, call.summary), ("lab", "core", 200, "GET x"))
+        self.assertEqual(self.throttle.used("lab"), 1)
+        self.assertAlmostEqual(self.throttle.spacing_gap("core"), throttling.SPACING["core"])
+
+    def test_the_call_gap_is_waited_before_the_next_request(self):
+        self.turn(bucket="search")
+        self.turn(bucket="search")
+        self.assertEqual(self.clock.sleeps, [throttling.SPACING["search"]])
+
+    def test_send_is_given_the_time_left(self):
+        deadline = throttling.Deadline(self.clock)
+        self.clock.sleep(30)
+        self.turn(deadline=deadline)
+        self.assertEqual(self.sent, [70])
+
+    def test_a_failed_send_is_still_charged_spaced_and_logged_with_status_0(self):
+        def no_answer(left):
+            raise RuntimeError("no answer")
+        with self.assertRaises(RuntimeError):
+            self.turn(send=no_answer)
+        self.assertEqual((self.throttle.used("lab"), [c.status for c in self.throttle.entries()]), (1, [0]))
+        self.assertGreater(self.throttle.spacing_gap("core"), 0)
+        self.assertTrue(self.lock_is_free())
+
+
+class Checks(TurnCase):
+    def test_a_short_block_is_waited_out_without_the_lock(self):
+        self.other_agent()._mark("core", {"core": self.clock.now() + 20}, spaced=False)
+        with self.assertLogs("gh-tollbooth", "INFO"):
+            self.turn()
+        self.assertEqual((self.clock.sleeps, len(self.sent)), ([20], 1))
+
+    def test_a_block_longer_than_max_wait_is_exit_75_before_anything(self):
+        self.other_agent()._mark("core", {"core": self.clock.now() + 120}, spaced=False)
+        with self.assertRaises(core.TollboothError) as cm:
+            self.turn()
+        self.assertEqual(cm.exception.code, core.EX_LIMITED)
+        self.assertEqual((self.sent, self.clock.sleeps, self.throttle.used("lab")), ([], [], 0))
+
+    def test_a_used_up_budget_is_exit_4_and_sends_nothing(self):
+        self.turn(budget=1)
+        with self.assertRaises(core.TollboothError) as cm:
+            self.turn(budget=1)
+        self.assertEqual((cm.exception.code, len(self.sent)), (core.EX_BUDGET, 1))
+
+    def test_the_budget_is_checked_again_under_the_lock(self):
+        # calls at the same time can't overrun a budget: another agent charges between the two checks
+        self.throttle._check("lab", 1, "core")
+        self.other_agent()._charge("lab")
+        with self.assertRaises(core.TollboothError) as cm:
+            self.throttle._attempt("lab", 1, "core", throttling.Deadline(self.clock), "GET x", self.send)
+        self.assertEqual((cm.exception.code, self.sent), (core.EX_BUDGET, []))
+
+
+class AnotherRound(TurnCase):
+    """Another agent got in while we waited for the lock: the turn goes round again."""
+
+    def test_a_block_recorded_meanwhile(self):
+        self.turn(bucket="search")
+        self.clock.sleeps.clear()
+        sleep = self.clock.sleep
+
+        def sleep_while_another_agent_is_blocked(seconds):
+            sleep(seconds)
+            if len(self.clock.sleeps) == 1:  # during the call gap
+                self.other_agent()._mark("search", {"search": self.clock.now() + 10}, spaced=False)
+        with mock.patch.object(self.clock, "sleep", sleep_while_another_agent_is_blocked):
+            self.turn(bucket="search")
+        self.assertEqual((self.clock.sleeps, len(self.sent)), ([throttling.SPACING["search"], 10], 2))
+
+    def test_a_long_call_gap_landed_meanwhile(self):
+        hold = self.throttle.hold
+        landed = []
+
+        def hold_after_another_agents_code_search(at):
+            if not landed:
+                landed.append(1)
+                self.other_agent()._mark("code_search")
+            return hold(at)
+        with mock.patch.object(self.throttle, "hold", hold_after_another_agents_code_search):
+            self.turn(bucket="code_search")
+        self.assertEqual((self.clock.sleeps, len(self.sent)), ([throttling.SPACING["code_search"]], 1))
 
 
 if __name__ == "__main__":

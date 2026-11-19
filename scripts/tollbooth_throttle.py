@@ -3,6 +3,9 @@
 The machine-wide lock is a filelock FileLock (flock on Unix) on `lock` in the shared state folder.
 The shared state (call times, blocks, budget charges and the call log) is one SQLite file there, state.db.
 A Deadline is one call's time budget: every wait asks it first, and it picks exit 75 or 76.
+A command takes one turn per request with Throttle.turn(): check the budget and blocks, wait without
+the lock, then under the lock check again, charge, send and record. Charging, marking and logging are
+private, so no caller can get that order wrong.
 Not here: settings, exit codes and errors (tollbooth_core).
 """
 from __future__ import annotations
@@ -22,9 +25,10 @@ from filelock import FileLock, Timeout
 from tenacity import retry, retry_if_exception, stop_after_attempt
 
 import tollbooth_core as core
-from tollbooth_core import EX_BUSY, EX_FAIL, EX_LIMITED, TollboothError, log
+from tollbooth_core import EX_BUDGET, EX_BUSY, EX_FAIL, EX_LIMITED, TollboothError, log
 
 T = TypeVar("T")
+R = TypeVar("R")
 
 FS_RETRIES = 5             # tries for a file step whose folder someone deletes (rm -rf ~/.cache/gh-tollbooth)
 # How a file step fails when the folder is deleted under it: not found, mkdir losing a race (exists),
@@ -33,6 +37,8 @@ VANISHED = (errno.ENOENT, errno.EEXIST, errno.EINVAL)
 LOCK_POLL = 0.2            # seconds between tries for a held lock
 WAIT_NOTICE = 5            # seconds of waiting for the lock before one "waiting" line on stderr
 MIN_CALL_TIME = 15         # seconds; no request starts with less time left (or half the deadline, if shorter)
+SPACING_UNDER_LOCK = 2.5   # seconds; a longer call gap (code search) is slept without the lock
+MAX_PASSES = 60            # turns one call takes before it gives up; a safety net, waits end it sooner
 SPACING = {"graphql": 1.0, "core": 0.5, "search": 2.2, "code_search": 6.5}  # seconds between calls, per bucket
 BLOCK_CAP = 3600           # seconds; GitHub limits reset hourly, so a longer wait is recorded as one hour...
 BLOCK_STALE = 3700         # ...and a block further ahead than this can't be real (a clock step): it is ignored
@@ -77,6 +83,11 @@ def _limited(what: str, seconds: float, clock: core.Clock) -> TollboothError:
     until = dt.datetime.fromtimestamp(clock.now() + seconds).strftime("%H:%M:%S")
     return TollboothError(f"{what} is rate-limited until {until}. Stop and report; do not retry in a loop.",
                           EX_LIMITED)
+
+
+def _budget_error(label: str, budget: int) -> TollboothError:
+    return TollboothError(f"the budget of {budget} GitHub calls for '{label}' is used up. "
+                          "Stop querying and report what you have.", EX_BUDGET)
 
 
 def _printable(text: str) -> str:
@@ -146,7 +157,7 @@ class Deadline:
 # ---------- shared throttle ----------
 
 class Throttle:
-    """The machine-wide lock and the shared state, in the shared state folder.
+    """The machine-wide lock, the shared state and the turn every request takes through them.
 
     Times come from `clock`: its wall clock for what is shared between processes, its monotonic clock
     for a call's own deadline.
@@ -191,6 +202,64 @@ class Throttle:
             yield self
         finally:
             lock.release()
+
+    # ---- one turn ----
+
+    def turn(self, label: str, budget: int | None, bucket: str, deadline: Deadline, summary: str,
+             send: Callable[[float], tuple[R, int]]) -> R:
+        """One request through the shared throttle; returns what `send` returned first.
+
+        1. Check: the label's budget (exit 4) and a block on the bucket longer than TOLLBOOTH_MAX_WAIT (75).
+        2. Without the lock: wait out a short block, then the bucket's call gap; the Deadline decides.
+        3. Under the lock: check again, charge the label, call send(seconds_left), record the call.
+        If another agent blocked or used the bucket while we waited for the lock, go round again.
+        `send` returns (result, HTTP status). A request is charged before it is sent, so a killed
+        process pays; if `send` raises, the call is still spaced and logged, with status 0.
+        """
+        for _ in range(MAX_PASSES):
+            self._check(label, budget, bucket)
+            self._wait_turn(bucket, deadline)
+            got = self._attempt(label, budget, bucket, deadline, summary, send)
+            if got is not None:
+                return got[0]
+        raise _busy("still not our turn after repeated waits")
+
+    def _check(self, label: str, budget: int | None, bucket: str) -> None:
+        if budget is not None and self.used(label) >= budget:
+            raise _budget_error(label, budget)
+        left = self.blocked_for(bucket)
+        if left > core.SETTINGS.max_wait:
+            raise _limited(bucket, left, self.clock)
+
+    def _wait_turn(self, bucket: str, deadline: Deadline) -> None:
+        left = self.blocked_for(bucket)
+        if left > 0:
+            deadline.wait(left, limit=bucket)
+        deadline.wait(self.spacing_gap(bucket))
+
+    def _attempt(self, label: str, budget: int | None, bucket: str, deadline: Deadline, summary: str,
+                 send: Callable[[float], tuple[R, int]]) -> tuple[R] | None:
+        """Under the lock: check again, charge, send, record. None means another agent got in first."""
+        with self.hold(deadline.at):
+            if self.blocked_for(bucket) > 0:  # another agent recorded a block while we waited for the lock
+                return None
+            if budget is not None and self.used(label) >= budget:
+                raise _budget_error(label, budget)  # checked under the lock, so calls at once can't overrun it
+            gap = self.spacing_gap(bucket)
+            if gap > SPACING_UNDER_LOCK:  # another agent's code search landed meanwhile
+                return None
+            deadline.wait(gap)
+            self._charge(label)
+            started = self.clock.mono()
+            try:
+                result, status = send(deadline.left())
+            except Exception:
+                self._mark(bucket)
+                self._log(label, bucket, 0, self.clock.mono() - started, summary)
+                raise
+            self._mark(bucket)
+            self._log(label, bucket, status, self.clock.mono() - started, summary)
+            return (result,)
 
     # ---- state.db: one short transaction per step, safe with or without hold() ----
 
@@ -239,7 +308,7 @@ class Throttle:
         elapsed = self.clock.now() - row[0] if row else SPACING[bucket]
         return SPACING[bucket] - elapsed if 0 <= elapsed < SPACING[bucket] else 0.0
 
-    def mark(self, bucket: str, blocks: dict[str, float] | None = None, spaced: bool = True) -> None:
+    def _mark(self, bucket: str, blocks: dict[str, float] | None = None, spaced: bool = True) -> None:
         """Record a call's time (for spacing) and blocks {bucket: until} that every agent must honor.
 
         A block is cut to BLOCK_CAP from now. A shorter block never shortens a longer one, unless the stored
@@ -258,8 +327,8 @@ class Throttle:
 
     # ---- budgets: per label and wall-clock hour, charged before the call starts ----
 
-    def charge(self, label: str) -> int:
-        """Charge one call to `label` in this hour and return the hour (for refund). Old charges are deleted."""
+    def _charge(self, label: str) -> None:
+        """Charge one call to `label` in this hour. Charges older than the window are deleted."""
         hour = int(self.clock.now() // 3600)
 
         def record(con: sqlite3.Connection) -> None:
@@ -267,12 +336,6 @@ class Throttle:
             con.execute("INSERT INTO charge VALUES (?, ?, 1) ON CONFLICT (label, hour) DO UPDATE SET n = n + 1",
                         (label, hour))
         self._db(record)
-        return hour
-
-    def refund(self, label: str, hour: int) -> None:
-        """Take back one charge of `label` in `hour`, never below zero."""
-        self._db(lambda con: con.execute("UPDATE charge SET n = n - 1 WHERE label = ? AND hour = ? AND n > 0",
-                                         (label, hour)))
 
     def used(self, label: str) -> int:
         """Calls charged to `label` in this hour and the 24 before it (the hour after counts too: a clock step)."""
@@ -284,7 +347,7 @@ class Throttle:
 
     # ---- call log (informational; budgets don't depend on it) ----
 
-    def log(self, label: str, bucket: str, status: int, secs: float, summary: str) -> None:
+    def _log(self, label: str, bucket: str, status: int, secs: float, summary: str) -> None:
         """Add one call to the log and keep the newest LOG_KEEP. A call that can't be logged is dropped."""
         summary = _printable(re.sub(r"\s+", " ", summary))[:LOG_SUMMARY]
 
