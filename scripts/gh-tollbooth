@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# gh-tollbooth: the command agents run. uv runs tollbooth_cli.py with this checkout's locked
+# dependencies, building .venv on first use. Python runs in isolated mode (-I): PYTHONPATH and the
+# user's site-packages can't put code into the process that reads the token.
+root=$(cd "$(dirname "$(realpath "$0")")/.." && pwd) || exit 1
+exec uv run --quiet --locked --project "$root" python -I "$root/scripts/tollbooth_cli.py" "$@"

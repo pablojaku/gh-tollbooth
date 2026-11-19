@@ -4,7 +4,7 @@ Settings are TOLLBOOTH_* environment variables, read by pydantic-settings. A bad
 one line on stderr and the default is used: a typo in one agent's environment must not stop its calls.
 The machine-wide lock is a filelock FileLock (flock on Unix) on `lock` in the shared state folder.
 The shared state (call times, blocks, budget charges and the call log) is one SQLite file there, state.db.
-Not here: talking to GitHub (tollbooth_http).
+Not here: talking to GitHub (tollbooth_http) and the command line (tollbooth_cli).
 """
 from __future__ import annotations
 
@@ -72,6 +72,16 @@ class TollboothError(Exception):
     def __init__(self, msg: str, code: int):
         super().__init__(msg)
         self.code = code
+
+
+def infer_bucket(path: str) -> str:
+    """GitHub's rate-limit bucket for a relative API path. GitHub routes `SEARCH/x` like `search/x`."""
+    ep = path.lstrip("/").lower()
+    if ep == "graphql":
+        return "graphql"
+    if ep.startswith("search/code"):
+        return "code_search"
+    return "search" if ep.startswith("search/") else "core"
 
 
 @dataclass(frozen=True)
