@@ -39,6 +39,7 @@ VANISHED = (errno.ENOENT, errno.EEXIST, errno.EINVAL)
 LOCK_POLL = 0.2            # seconds between tries for a held lock
 WAIT_NOTICE = 5            # seconds of waiting for the lock before one "waiting" line on stderr
 MIN_CALL_TIME = 15         # seconds; no request starts with less time left (or half the deadline, if shorter)
+MIN_SEND_TIME = 1.0        # seconds a charged request gets even past the deadline: once charged, it is sent
 SPACING_UNDER_LOCK = 2.5   # seconds; a longer call gap (code search) is slept without the lock
 MAX_PASSES = 60            # turns one call takes before it gives up; a safety net, waits end it sooner
 FIRST_BACKOFF = 60         # seconds to wait after a secondary limit that names none; doubled on each such answer
@@ -296,7 +297,10 @@ class Throttle:
     def _attempt(self, label: str, budget: int | None, bucket: str, deadline: Deadline, summary: str,
                  send: Callable[[float], tuple[R, int, Limit | None]]) -> tuple[R, Limit | None, float] | None:
         """Under the lock: check again, charge, send, record. Returns send's result, its Limit and the
-        seconds to wait for it; None means another agent got in first."""
+        seconds to wait for it; None means another agent got in first.
+
+        The time check comes before the charge, and charging can be slow (another agent's change to
+        state.db), so send gets at least MIN_SEND_TIME: a charged request is always sent."""
         with self.hold(deadline.at):
             if self.blocked_for(bucket) > 0:  # another agent recorded a block while we waited for the lock
                 return None
@@ -309,7 +313,7 @@ class Throttle:
             self._charge(label)
             started = self.clock.mono()
             try:
-                result, status, limit = send(deadline.left())
+                result, status, limit = send(max(deadline.left(), MIN_SEND_TIME))
             except Exception:
                 self._mark(bucket)
                 self._log(label, bucket, 0, self.clock.mono() - started, summary)

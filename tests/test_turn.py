@@ -108,6 +108,18 @@ class TurnCase(ClockCase):
 
 
 class Turn(TurnCase):
+    def test_a_charged_request_is_sent_even_if_charging_ate_the_time_left(self):
+        # a slow state.db (another agent's change) can take longer than the time kept for the request
+        charge = self.throttle._charge
+
+        def slow_charge(label):
+            charge(label)
+            self.clock.sleep(150)  # well past the 100 s deadline
+        with mock.patch.object(self.throttle, "_charge", slow_charge):
+            self.assertEqual(self.turn(), "answer")
+        self.assertEqual(self.sent, [throttling.MIN_SEND_TIME])
+        self.assertEqual(self.throttle.used("lab"), 1)
+
     def test_one_turn_sends_once_holding_the_lock_and_records_it(self):
         held = []
 

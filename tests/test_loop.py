@@ -77,6 +77,13 @@ class Answers(LoopCase):
         self.fetch()
         self.assertEqual(self.send.call_args.kwargs["timeout"], 49.5)  # 50 s, less core's 0.5 s call gap
 
+    def test_a_request_charged_after_the_deadline_still_goes_out_with_1_s(self):
+        # it used to reach tollbooth_http with a timeout of 0 or less: exit 2 "refused", already charged
+        charge = self.throttle._charge
+        self.patch(self.throttle, "_charge", lambda label: (charge(label), self.clock.sleep(150)))
+        self.assertIs(self.fetch(), OK)
+        self.assertEqual(self.send.call_args.kwargs["timeout"], throttling.MIN_SEND_TIME)
+
     def test_the_log_shows_what_was_asked(self):
         self.fetch("POST", "graphql", json_body={"query": "{ viewer { login } }"})
         self.assertEqual([c.summary for c in self.throttle.entries()], ["POST graphql { viewer { login } }"])
