@@ -165,7 +165,7 @@ class Checks(TurnCase):
 
     def test_the_budget_is_checked_again_under_the_lock(self):
         # calls at the same time can't overrun a budget: another agent charges between the two checks
-        self.throttle._check("lab", 1, "core")
+        self.throttle.check("lab", 1, "core")
         self.other_agent()._charge("lab")
         with self.assertRaises(core.TollboothError) as cm:
             self.throttle._attempt("lab", 1, "core", throttling.Deadline(self.clock), "GET x", self.send)
@@ -243,9 +243,10 @@ class Limits(TurnCase):
 
     def test_the_fourth_limited_answer_is_exit_75(self):
         one = throttling.Limit("core", ("core",), 1)
-        with self.assertRaises(core.TollboothError) as cm:
+        with self.assertRaises(throttling.StoppedOnAnswer) as cm:
             self.turn(send=self.answers(one, one, one, one))
         self.assertEqual((cm.exception.code, len(self.sent)), (core.EX_LIMITED, 4))
+        self.assertEqual(cm.exception.answer, "answer")  # send's result, for the command to show
 
     def test_a_limit_on_a_resource_the_throttle_does_not_track_is_not_shared(self):
         with self.assertRaises(core.TollboothError) as cm:

@@ -19,7 +19,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from filelock import FileLock, Timeout
 from tenacity import retry, retry_if_exception, stop_after_attempt
@@ -82,6 +82,16 @@ class Limit:
     what: str                 # for messages: a bucket, "every bucket", or an untracked resource
     buckets: tuple[str, ...]  # the buckets every agent must stop for; empty: only this call stops
     seconds: float | None     # how long GitHub said to wait; None: it didn't say, so the shared backoff decides
+
+
+class StoppedOnAnswer(TollboothError):
+    """A call stopped on GitHub's own answer (a rate limit it won't wait out, or a 502/504).
+
+    `answer` is that answer, as send returned it, so a command can still show what GitHub said."""
+
+    def __init__(self, error: TollboothError, answer: Any):
+        super().__init__(str(error), error.code)
+        self.answer = answer
 
 
 def _busy(why: str) -> TollboothError:
@@ -226,13 +236,14 @@ class Throttle:
         If another agent blocked or used the bucket while we waited for the lock, go round again.
         `send` returns (result, HTTP status, Limit or None). A Limit is recorded as a block for every
         agent; the turn then waits it out and sends again, up to MAX_ANSWERS limited answers. A limit
-        on a resource the throttle doesn't track is not shared, and ends this call (exit 75).
+        on a resource the throttle doesn't track is not shared, and ends this call (exit 75). A limit
+        that ends the call is a StoppedOnAnswer that carries send's result.
         A request is charged before it is sent, so a killed process pays; if `send` raises, the call
         is still spaced and logged, with status 0.
         """
         answers = 0
         for _ in range(MAX_PASSES):
-            self._check(label, budget, bucket)
+            self.check(label, budget, bucket)
             self._wait_turn(bucket, deadline)
             got = self._attempt(label, budget, bucket, deadline, summary, send)
             if got is None:
@@ -241,12 +252,17 @@ class Throttle:
             if limit is None:
                 return result
             answers += 1
-            if not limit.buckets or answers >= MAX_ANSWERS:
-                raise _limited(limit.what, seconds, self.clock)
-            deadline.wait(seconds, limit=limit.what)
+            try:
+                if not limit.buckets or answers >= MAX_ANSWERS:
+                    raise _limited(limit.what, seconds, self.clock)
+                deadline.wait(seconds, limit=limit.what)
+            except TollboothError as e:  # the call stops on this answer: hand it to the caller
+                raise StoppedOnAnswer(e, result) from None
         raise _busy("still not our turn after repeated waits")
 
-    def _check(self, label: str, budget: int | None, bucket: str) -> None:
+    def check(self, label: str, budget: int | None, bucket: str) -> None:
+        """Fail before any work if `label` can't call `bucket` now: its budget is used up (exit 4), or the
+        bucket is blocked for longer than TOLLBOOTH_MAX_WAIT (exit 75)."""
         if budget is not None and self.used(label) >= budget:
             raise _budget_error(label, budget)
         left = self.blocked_for(bucket)

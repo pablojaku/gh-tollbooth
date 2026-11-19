@@ -16,7 +16,6 @@ import re
 import sys
 from collections import Counter
 from contextlib import suppress
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -28,6 +27,7 @@ from pydantic import BaseModel, BeforeValidator, Field, ValidationError  # noqa:
 import tollbooth_core as core  # noqa: E402
 import tollbooth_http as http  # noqa: E402
 import tollbooth_throttle  # noqa: E402
+from tollbooth_loop import Caller  # noqa: E402
 
 BUCKETS = ("graphql", "core", "search", "code_search")
 LABEL_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # always use .fullmatch: "$" would accept a trailing newline
@@ -65,13 +65,6 @@ class _RateLimit(BaseModel):
 
 # ---------- what every command shares ----------
 
-@dataclass
-class Run:
-    label: str
-    budget: int | None
-    throttle: tollbooth_throttle.Throttle
-
-
 def _clock(at: float) -> str:
     """A wall-clock time as HH:MM:SS, local time."""
     return dt.datetime.fromtimestamp(at).strftime("%H:%M:%S")
@@ -81,7 +74,7 @@ def _shown(count: int | None) -> str:
     return "?" if count is None else str(count)
 
 
-def _start(ctx: click.Context, label: str | None, budget: int | None) -> Run:
+def _start(ctx: click.Context, label: str | None, budget: int | None) -> Caller:
     """Merge --as and --budget given before and after the command, check them, and open the state folder."""
     who: str = label or ctx.obj["label"] or "anon"
     limit: int | None = budget if budget is not None else ctx.obj["budget"]
@@ -95,7 +88,7 @@ def _start(ctx: click.Context, label: str | None, budget: int | None) -> Run:
     except OSError as e:
         raise core.TollboothError(f"can't create the state folder {folder} ({e.strerror or e}); "
                                   "set TOLLBOOTH_STATE_DIR to a folder you can write to", core.EX_FAIL) from None
-    return Run(who, limit, throttle)
+    return Caller(who, limit, throttle)
 
 
 def _reader_left() -> None:
@@ -162,9 +155,10 @@ def cli(ctx: click.Context, label: str | None, budget: int | None) -> None:
 @click.pass_context
 def status(ctx: click.Context, label: str | None, budget: int | None, last: int) -> None:
     """Rate-limit buckets and recent calls. Free: GitHub doesn't count it."""
-    run = _start(ctx, label, budget)
-    # Asked directly, not through the throttle: GitHub doesn't count rate_limit against any bucket.
-    resp = http.send("GET", "rate_limit", http.token(), timeout=30)
+    caller = _start(ctx, label, budget)
+    # Asked directly, not through the throttle: GitHub doesn't count rate_limit against any bucket,
+    # and status is what you run while buckets are blocked.
+    resp = http.send("GET", "rate_limit", caller.token(), timeout=30)
     if resp.status != 200:
         hint = " (GitHub rejected the token: run `gh auth login`, or check GH_TOKEN)" if resp.status == 401 else ""
         raise core.TollboothError(f"GET rate_limit answered HTTP {resp.status}{hint}", core.EX_FAIL)
@@ -176,10 +170,10 @@ def status(ctx: click.Context, label: str | None, budget: int | None, last: int)
     click.echo("bucket        remaining/limit  resets")
     for name in BUCKETS:
         b: _Bucket = getattr(resources, name)
-        left = run.throttle.blocked_for(name)
-        blocked = f"  BLOCKED until {_clock(run.throttle.clock.now() + left)}" if left > 0 else ""
+        left = caller.throttle.blocked_for(name)
+        blocked = f"  BLOCKED until {_clock(caller.throttle.clock.now() + left)}" if left > 0 else ""
         click.echo(f"{name:13} {_shown(b.remaining):>6}/{_shown(b.limit):<6}  {_clock(b.reset)}{blocked}")
-    recent = run.throttle.entries(since=run.throttle.clock.now() - 3600)
+    recent = caller.throttle.entries(since=caller.throttle.clock.now() - 3600)
     click.echo(f"\ngh-tollbooth calls in the last hour: {len(recent)}")
     for (who, bucket), n in Counter((c.label, c.bucket) for c in recent).most_common(15):
         click.echo(f"  {n:4}  {bucket:12} {who}")
