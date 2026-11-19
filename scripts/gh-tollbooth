@@ -5,9 +5,17 @@ Talks to the GitHub API directly, with the login `gh` already has (or GH_TOKEN).
 Python 3.9+. Results go to stdout; progress goes to stderr.
 
   gh-tollbooth status                           rate-limit buckets + recent calls (free)
+  gh-tollbooth call [--no-cache] -- api <args>  one read-only GitHub API request, throttled
 
-Global options (before or after the command): --as LABEL  --budget N
-Exit codes: 0 ok, 1 no token, no answer from GitHub or no state folder, 2 usage.
+`call` takes `gh api`'s form: one endpoint (or graphql) with -X GET|HEAD, -f/-F key=value,
+-H 'Accept: ...', -i and --silent. It prints GitHub's answer as it is: pipe it to jq to pick fields.
+
+Global options (before or after the command, before `--`): --as LABEL  --budget N
+--budget caps the GitHub calls LABEL makes in 24 h. It is cooperative: it holds while every command
+passes it, and can't stop an agent that drops it, picks another label or calls GitHub another way.
+Exit codes: 0 ok; 1 no token, no answer from GitHub, an HTTP error answer or no state folder;
+2 usage or a request gh-tollbooth refuses; 3 GitHub gave up on the request; 4 budget used up;
+75 GitHub rate limit (stop and report the time); 76 busy or out of time (retry once later).
 
 Trust boundary: an agent may choose the arguments, never the environment. Python runs in isolated
 mode (-I), so PYTHONPATH can't put code into this process. The environment still picks the python3
@@ -21,18 +29,22 @@ import datetime as dt
 import io
 import json
 import os
+import re
 import sys
 from contextlib import suppress
+from http.client import responses as REASONS
 from pathlib import Path
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tollbooth_core as core  # noqa: E402
 import tollbooth_http as http  # noqa: E402
 from tollbooth_core import EX_FAIL, EX_USAGE, TollboothError, clock_in, eprint  # noqa: E402
+from tollbooth_guard import CallRequest, parse_call  # noqa: E402
+from tollbooth_loop import Caller, StoppedOnAnswer  # noqa: E402
 from tollbooth_throttle import Throttle  # noqa: E402
 
 BUCKETS = ("graphql", "core", "search", "code_search")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def _count(value) -> str:
@@ -40,9 +52,10 @@ def _count(value) -> str:
     return str(value) if isinstance(value, int) and not isinstance(value, bool) else "?"
 
 
-def cmd_status(ctx, a) -> int:
-    # Asked directly, not through the throttle: GitHub doesn't count rate_limit against any bucket.
-    resp = http.send("GET", "rate_limit", http.token(), timeout=30)
+def cmd_status(caller: Caller, a: argparse.Namespace) -> int:
+    # Asked directly, not through the throttle: GitHub doesn't count rate_limit against any bucket,
+    # and status is what you run while buckets are blocked (docs/adr/0001).
+    resp = http.send("GET", "rate_limit", caller.token(), timeout=30)
     if resp.status != 200:
         hint = " (GitHub rejected the token: run `gh auth login`, or check GH_TOKEN)" if resp.status == 401 else ""
         raise TollboothError(f"GET rate_limit answered HTTP {resp.status}{hint}", EX_FAIL)
@@ -57,10 +70,10 @@ def cmd_status(ctx, a) -> int:
         raise TollboothError("GET rate_limit: the answer is not GitHub's rate-limit document", EX_FAIL)
     print("bucket        remaining/limit  resets")
     for (b, _), line in zip(rows, lines):
-        left = ctx.throttle.blocked_for(b)
-        print(line + (f"  BLOCKED until {clock_in(left, ctx.throttle.clock)}" if left > 0 else ""))
+        left = caller.throttle.blocked_for(b)
+        print(line + (f"  BLOCKED until {clock_in(left, caller.throttle.clock)}" if left > 0 else ""))
     hour_ago = (dt.datetime.now() - dt.timedelta(hours=1)).isoformat(timespec="seconds")
-    recent = [e for e in ctx.throttle.entries() if len(e) >= 7 and e[0] >= hour_ago]
+    recent = [e for e in caller.throttle.entries() if len(e) >= 7 and e[0] >= hour_ago]
     counts: dict = {}
     for e in recent:
         counts[(e[1], e[3])] = counts.get((e[1], e[3]), 0) + 1
@@ -72,6 +85,45 @@ def cmd_status(ctx, a) -> int:
     return 0
 
 
+def cmd_call(caller: Caller, a: argparse.Namespace) -> int:
+    """One read-only request, as `gh api` would make it; GitHub's answer goes to stdout byte for byte."""
+    req = parse_call(a.gh_args[1:] if a.gh_args[:1] == ["--"] else a.gh_args)
+    if sys.stdout is None and not req.silent:  # `>&-`: the call would be charged and its answer lost
+        raise TollboothError("stdout is closed, so GitHub's answer would be lost: redirect it, or pass --silent",
+                             EX_USAGE)
+    try:
+        resp = caller.fetch(req.method, req.path, accept=req.accept, json_body=req.json_body)
+    except ValueError as e:  # the guard let through something tollbooth_http refuses
+        raise TollboothError(f"refused: {e}", EX_USAGE)
+    except StoppedOnAnswer as e:  # a 502/504 or a rate limit: show GitHub's answer, then its exit code
+        write_answer(e.answer, req)
+        raise
+    write_answer(resp, req)
+    if 200 <= resp.status < 300:
+        return 0
+    eprint(f"gh-tollbooth: HTTP {resp.status} {REASONS.get(resp.status, '')}".rstrip())
+    return EX_FAIL
+
+
+def write_answer(resp: http.Response, req: CallRequest) -> None:
+    """The answer on stdout: with -i the status line and headers first; with --silent nothing."""
+    if req.silent:
+        return
+    sys.stdout.flush()  # anything printed as text goes first
+    out = sys.stdout.buffer
+    if req.include:
+        head = [f"HTTP/1.1 {resp.status} {REASONS.get(resp.status, '')}".rstrip()]
+        head += [f"{_header_name(k)}: {v}" for k, v in resp.headers.items()]
+        out.write("".join(CONTROL_RE.sub("?", line) + "\n" for line in head).encode("utf-8", "replace") + b"\n")
+    out.write(resp.body)
+    out.flush()
+
+
+def _header_name(name: str) -> str:
+    """x-ratelimit-remaining -> X-Ratelimit-Remaining, the way gh prints header names."""
+    return "-".join(part.capitalize() for part in name.split("-"))
+
+
 def count(text: str) -> int:
     n = int(text)
     if n < 0:
@@ -80,14 +132,20 @@ def count(text: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    common = argparse.ArgumentParser(add_help=False)
+    # allow_abbrev=False everywhere: argparse would otherwise read `--bud 5` as `--budget 5`
+    common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     common.add_argument("--as", dest="label", default=argparse.SUPPRESS, help="tag calls in the log")
-    common.add_argument("--budget", type=int, default=argparse.SUPPRESS, help="max GitHub calls for --as LABEL")
-    p = argparse.ArgumentParser(prog="gh-tollbooth", parents=[common], description=__doc__,
+    common.add_argument("--budget", type=int, default=argparse.SUPPRESS,
+                        help="cooperative cap on GitHub calls for --as LABEL in 24 h")
+    p = argparse.ArgumentParser(prog="gh-tollbooth", parents=[common], description=__doc__, allow_abbrev=False,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("status", parents=[common], help="buckets + recent calls (free)")
+    s = sub.add_parser("status", parents=[common], allow_abbrev=False, help="buckets + recent calls (free)")
     s.add_argument("--last", type=count, default=8, help="recent calls to list (default 8)")
+    s = sub.add_parser("call", parents=[common], allow_abbrev=False,
+                       help="one read-only GitHub API request: call -- api <args>")
+    s.add_argument("--no-cache", action="store_true", help="accepted and ignored: gh-tollbooth doesn't cache")
+    s.add_argument("gh_args", nargs=argparse.REMAINDER, help="api ENDPOINT [options], as for `gh api`")
     return p
 
 
@@ -120,11 +178,12 @@ def main(argv=None) -> int:
         eprint(f"gh-tollbooth: can't create the state folder {core.STATE_DIR} ({e.strerror or e}); "
                "set TOLLBOOTH_STATE_DIR to a folder you can write to")
         return EX_FAIL
-    ctx = SimpleNamespace(label=label, budget=budget, throttle=throttle)
-    handler = {"status": cmd_status}[a.cmd]
+    caller = Caller(label, budget, throttle)
+    handler = {"status": cmd_status, "call": cmd_call}[a.cmd]
     try:
-        code = handler(ctx, a)
-        sys.stdout.flush()  # a closed pipe shows here when the output was small
+        code = handler(caller, a)
+        if sys.stdout is not None:  # None when stdout was closed (`>&-`)
+            sys.stdout.flush()  # a closed pipe shows here when the output was small
         return code
     except BrokenPipeError:
         return _reader_left()

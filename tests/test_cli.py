@@ -9,11 +9,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from _fixtures import SCRIPTS, TOKEN, answer, http, load_cli, logged, recorded
+from _fixtures import SCRIPTS, TOKEN, answer, http, load_cli, logged, primary, recorded
 
 cli = load_cli("tollbooth_cli")
 core = cli.core
@@ -181,11 +182,140 @@ class GlobalOptions(CliCase):
             self.assertEqual(self.main(["status"])[0], core.EX_USAGE)
             self.assertEqual(self.main(["status", "--as", "fine"])[0], 0)
 
+    def test_abbreviated_options_are_refused(self):
+        # argparse reads `--bud 5` as `--budget 5` unless told not to
+        for argv in (["--a", "lab", "status"], ["--as", "lab", "--bud", "3", "status"], ["status", "--la", "2"],
+                     ["call", "--as", "lab", "--no-c", "--", "api", "repos/o/r"]):
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
+                self.main(argv)
+            self.assertEqual(cm.exception.code, core.EX_USAGE, argv)
+        self.send.assert_not_called()
+
     def test_a_budget_needs_a_label(self):
         code, _, err = self.main(["--budget", "3", "status"])
         self.assertEqual(code, core.EX_USAGE)
         self.assertIn("--as", err)
         self.assertEqual(self.main(["--as", "lab", "--budget", "3", "status"])[0], 0)
+
+
+class Call(CliCase):
+    """`call -- api ...`: one read-only request through the throttle, its answer on stdout byte for byte."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(core, "SPACING", {k: 0 for k in core.SPACING})  # the real clock runs here
+        p.start()
+        self.addCleanup(p.stop)
+
+    def call(self, argv, send=None, token=TOKEN):
+        """Run the CLI with a fake token and a fake GitHub. Returns (exit code, stdout bytes, stderr)."""
+        raw, err = io.BytesIO(), io.StringIO()
+        out = io.TextIOWrapper(raw, encoding="utf-8")
+        send = send if send is not None else answer(200, body=b'{"ok": 1}')
+        with mock.patch.object(http, "send", fake(send)) as self.send, \
+                mock.patch.object(http, "token", fake(token)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(argv)
+            out.flush()
+        data = raw.getvalue()
+        self.assertNotIn(TOKEN.encode(), data)
+        self.assertNotIn(TOKEN, err.getvalue())
+        return code, data, err.getvalue()
+
+    def test_prints_githubs_answer_byte_for_byte(self):
+        body = b"line one\r\nnot utf-8: \xff\xfe\x00 end"
+        code, out, err = self.call(["call", "--", "api", "repos/o/r/contents/f", "-H",
+                                    "Accept: application/vnd.github.raw"], send=answer(200, body=body))
+        self.assertEqual((code, out, err), (0, body, ""))
+        args, kwargs = self.send.call_args
+        self.assertEqual((args, kwargs["accept"], kwargs["json_body"]),
+                         (("GET", "repos/o/r/contents/f", TOKEN), "application/vnd.github.raw", None))
+
+    def test_an_http_error_prints_the_body_and_exits_1(self):
+        for status, reason in ((404, "Not Found"), (401, "Unauthorized"), (301, "Moved Permanently")):
+            body = b'{"message": "nope"}'
+            code, out, err = self.call(["call", "--", "api", "repos/o/r"], send=answer(status, body=body))
+            self.assertEqual((code, out), (core.EX_FAIL, body), status)
+            self.assertEqual(err, f"gh-tollbooth: HTTP {status} {reason}\n")
+
+    def test_include_prints_the_status_line_and_headers_first(self):
+        reply = answer(200, {"X-RateLimit-Remaining": "4999", "Content-Type": "application/json", "X-Odd": "a\x1bb"},
+                       b"{}")
+        code, out, _ = self.call(["call", "--", "api", "-i", "rate_limit"], send=reply)
+        self.assertEqual((code, out), (0, b"HTTP/1.1 200 OK\nX-Ratelimit-Remaining: 4999\n"
+                                          b"Content-Type: application/json\nX-Odd: a?b\n\n{}"))
+
+    def test_silent_prints_nothing_and_still_exits_by_status(self):
+        self.assertEqual(self.call(["call", "--", "api", "--silent", "repos/o/r"])[:2], (0, b""))
+        code, out, err = self.call(["call", "--", "api", "--silent", "repos/o/r"], send=answer(404, body=b"{}"))
+        self.assertEqual((code, out), (core.EX_FAIL, b""))
+        self.assertIn("HTTP 404", err)
+
+    def test_a_refused_request_exits_2_with_its_hint_and_costs_nothing(self):
+        for args, hint in ((["api", "repos/o/r", "--jq", ".name"], "| jq"),
+                           (["api", "repos/o/r", "--cache", "1h"], "live, charged request"),
+                           (["api", "graphql", "-f", "query=mutation { x }"], "only GraphQL query"),
+                           (["issue", "list"], "API form")):
+            code, out, err = self.call(["--as", "lab", "call", "--"] + args)
+            self.assertEqual((code, out), (core.EX_USAGE, b""), args)
+            self.assertIn(hint, err)
+            self.send.assert_not_called()
+        throttle = throttling.Throttle(self.state)
+        self.assertEqual((throttle.used("lab"), throttle.entries()), (0, []))
+
+    def test_a_graphql_query_is_posted_with_its_variables(self):
+        doc = "query($n: Int!) { search(query: \"x\", type: REPOSITORY, first: $n) { repositoryCount } }"
+        self.assertEqual(self.call(["call", "--", "api", "graphql", "-f", f"query={doc}", "-F", "n=3"])[0], 0)
+        args, kwargs = self.send.call_args
+        self.assertEqual((args, kwargs["json_body"]),
+                         (("POST", "graphql", TOKEN), {"query": doc, "variables": {"n": 3}}))
+
+    def test_rest_fields_and_head(self):
+        self.call(["call", "--", "api", "search/code", "-f", "q=x", "-F", "per_page=5"])
+        self.assertEqual(self.send.call_args.args, ("GET", "search/code?q=x&per_page=5", TOKEN))
+        code, out, _ = self.call(["call", "api", "-X", "HEAD", "repos/o/r"], send=answer(200, body=b""))
+        self.assertEqual((code, out), (0, b""))  # without `--` too
+        self.assertEqual(self.send.call_args.args, ("HEAD", "repos/o/r", TOKEN))
+
+    def test_as_and_budget_charge_the_label(self):
+        argv = ["call", "--as", "lab", "--budget", "1", "--no-cache", "--", "api", "repos/o/r"]
+        self.assertEqual(self.call(argv)[0], 0)
+        code, out, err = self.call(argv)
+        self.assertEqual((code, out), (core.EX_BUDGET, b""))
+        self.assertIn("budget of 1", err)
+        self.send.assert_not_called()
+        self.assertEqual(throttling.Throttle(self.state).used("lab"), 1)
+
+    def test_a_rate_limit_keeps_its_exit_code_and_prints_githubs_answer(self):
+        far = answer(403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": int(time.time() + 3000)},
+                     b'{"message": "API rate limit exceeded"}')
+        code, out, err = self.call(["call", "--", "api", "repos/o/r"], send=far)
+        self.assertEqual((code, out), (core.EX_LIMITED, far.body))
+        self.assertIn("rate-limited until", err)
+
+    def test_a_502_or_504_exits_3_and_prints_githubs_answer(self):
+        for status in (502, 504):
+            body = b'{"message": "Server Error"}'
+            code, out, err = self.call(["call", "--", "api", "repos/o/r"], send=answer(status, body=body))
+            self.assertEqual((code, out), (core.EX_HEAVY, body), status)
+            self.assertIn("502/504", err)
+        code, out, _ = self.call(["call", "--", "api", "--silent", "repos/o/r"], send=answer(502, body=b"x"))
+        self.assertEqual((code, out), (core.EX_HEAVY, b""))
+
+    def test_a_closed_stdout_is_refused_before_anything_is_sent(self):
+        err = io.StringIO()
+        for argv, code_wanted, sends in ((["--as", "lab", "call", "--", "api", "repos/o/r"], core.EX_USAGE, 0),
+                                         (["--as", "lab", "call", "--", "api", "--silent", "repos/o/r"], 0, 1)):
+            with mock.patch.object(http, "send", fake(answer(200, body=b"{}"))) as send, \
+                    mock.patch.object(http, "token", fake(TOKEN)), \
+                    contextlib.redirect_stdout(None), contextlib.redirect_stderr(err):  # like `>&-`
+                code = cli.main(argv)
+            self.assertEqual((code, send.call_count), (code_wanted, sends), argv)
+        self.assertIn("stdout is closed", err.getvalue())
+        self.assertEqual(throttling.Throttle(self.state).used("lab"), 1)  # only the --silent call
+
+    def test_status_works_with_a_spent_budget(self):
+        self.assertEqual(self.main(["--as", "lab", "--budget", "0", "status"])[0], 0)
 
 
 class StateFolder(CliCase):

@@ -1,11 +1,12 @@
 """tollbooth_loop: one GitHub request, and the decision to try it again. Stdlib only, Python 3.9+.
 
-fetch() is how gh-tollbooth's commands talk to GitHub. Each pass takes one turn through the shared
+A Caller is who is calling GitHub during one command: a label, its budget and the shared throttle.
+Caller.fetch() is how gh-tollbooth's commands talk to GitHub. Each pass takes one turn through the
 throttle (tollbooth_throttle: budget, blocks, call gap, the lock, charging, the log) and sends the
 request in it (tollbooth_http.send). Then it reads GitHub's answer:
 - not a rate limit: returned as it is, 404 and 403 included;
 - a primary limit blocks that bucket until GitHub's reset time, a secondary limit blocks every
-  bucket; either way fetch() waits and tries again, for at most MAX_ANSWERS limited answers;
+  bucket; either way it waits and tries again, for at most MAX_ANSWERS limited answers;
 - a 502 or 504 means GitHub gave up on the request (exit 3), with advice if it was a GraphQL query.
 
 A wait longer than TOLLBOOTH_MAX_WAIT ends the call at once (exit 75). The whole call ends within
@@ -13,8 +14,8 @@ TOLLBOOTH_DEADLINE seconds (exit 76 if it can't). Times come from the throttle's
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional, Protocol, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 
 import tollbooth_core as core
 import tollbooth_http as http
@@ -26,22 +27,25 @@ FIRST_BACKOFF = 60        # seconds to wait after a 429 that names no wait; doub
 MAX_ANSWERS = 4           # rate-limited answers one call takes before it gives up
 
 
-class FetchContext(Protocol):
-    """What fetch() needs from the command that calls it."""
-    label: str               # whose budget each request is charged to
-    budget: Optional[int]    # requests allowed for the label in 24 h; None = no limit
-    throttle: tollbooth_throttle.Throttle
-
-
 @dataclass(frozen=True)
 class _Request:
     method: str
     path: str
-    token: str
+    token: str = field(repr=False)  # never in a repr, a log line or a debug print
     accept: Optional[str]
     json_body: Optional[dict]
     bucket: str
     summary: str      # for the call log
+
+
+class StoppedOnAnswer(TollboothError):
+    """fetch() stopped on GitHub's own answer (a 502/504, or a rate limit it won't wait out).
+
+    `answer` is that answer, so a command can still show what GitHub said."""
+
+    def __init__(self, error: TollboothError, answer: http.Response):
+        super().__init__(str(error), error.code)
+        self.answer = answer
 
 
 class _Backoff:
@@ -67,39 +71,59 @@ class _Answer:
     delay: float      # seconds to wait before trying again; 0 if not rate-limited
 
 
-def fetch(ctx: FetchContext, method: str, path: str, *, accept: Optional[str] = None,
-          json_body: Optional[dict] = None) -> http.Response:
-    """Send one request through the shared throttle and return GitHub's answer.
+@dataclass
+class Caller:
+    """Who is calling GitHub during one command: a label, its budget and the shared throttle."""
+    label: str               # whose budget each request is charged to
+    budget: Optional[int]    # requests allowed for the label in 24 h; None = no limit
+    throttle: tollbooth_throttle.Throttle
+    _token: Optional[str] = field(default=None, init=False, repr=False, compare=False)
 
-    The token is asked for once, then cached on ctx.
-    Any answer that isn't a rate limit is returned as is, 404 and 403 included.
-    Raises TollboothError (exit 3, 4, 75, 76), NoToken, TransportError or ValueError.
-    A request is charged just before it is sent, and only if it is sent.
-    """
-    token = _token(ctx)
-    http.build_request(method, path, token, accept, json_body)  # a request it would refuse fails here
-    req = _Request(method, path, token, accept, json_body, core.infer_bucket(path), _summary(method, path, json_body))
-    throttle, clock = ctx.throttle, ctx.throttle.clock
-    deadline = clock.mono() + core.DEADLINE
-    backoff, answers = _Backoff(), 0
-    for _ in range(60):  # every pass sleeps or raises, so the deadline ends the loop; this is a safety net
-        throttle.check(ctx.label, ctx.budget, req.bucket)
-        throttle.wait_turn(req.bucket, deadline)
-        got = throttle.attempt(ctx.label, ctx.budget, req.bucket, deadline, req.summary,
-                               lambda left: _send(req, clock, backoff, left))
-        if got is None:  # the bucket was blocked or spaced again while we waited for the lock
-            continue
-        if got.verdict.kind is None:
-            return got.resp
-        if got.verdict.kind == "heavy":
-            raise _gave_up(req.method, req.path)
-        answers += 1
-        delay = max(1.0, got.delay)
-        if delay > tollbooth_throttle.MAX_WAIT or clock.mono() + delay > deadline or answers >= MAX_ANSWERS:
-            raise limited(got.limited, delay, clock)
-        eprint(f"gh-tollbooth: {got.limited} is rate-limited; waiting {delay:.0f} s (lock released)")
-        clock.sleep(delay)
-    raise core.busy("still blocked after repeated waits")
+    def token(self) -> str:
+        """The GitHub token, asked for on first use (`gh auth token` starts a process), then kept."""
+        if self._token is None:
+            self._token = http.token()
+        return self._token
+
+    def check(self, bucket: str) -> None:
+        """Fail before doing any work if this caller can't call `bucket` now: the budget is used up
+        (exit 4) or the bucket is blocked for longer than TOLLBOOTH_MAX_WAIT (exit 75)."""
+        self.throttle.check(self.label, self.budget, bucket)
+
+    def fetch(self, method: str, path: str, *, accept: Optional[str] = None,
+              json_body: Optional[dict] = None) -> http.Response:
+        """Send one request through the shared throttle and return GitHub's answer.
+
+        Any answer that isn't a rate limit is returned as is, 404 and 403 included.
+        Raises TollboothError (exit 3, 4, 75, 76), NoToken, TransportError or ValueError. A stop on
+        GitHub's own answer (a 502/504, a rate limit) is a StoppedOnAnswer that carries that answer.
+        A request is charged just before it is sent, and only if it is sent.
+        """
+        token = self.token()
+        http.build_request(method, path, token, accept, json_body)  # a request it would refuse fails here
+        req = _Request(method, path, token, accept, json_body, core.infer_bucket(path),
+                       _summary(method, path, json_body))
+        throttle, clock = self.throttle, self.throttle.clock
+        deadline = clock.mono() + core.DEADLINE
+        backoff, answers = _Backoff(), 0
+        for _ in range(60):  # every pass sleeps or raises, so the deadline ends the loop; this is a safety net
+            throttle.check(self.label, self.budget, req.bucket)
+            throttle.wait_turn(req.bucket, deadline)
+            got = throttle.attempt(self.label, self.budget, req.bucket, deadline, req.summary,
+                                   lambda left: _send(req, clock, backoff, left))
+            if got is None:  # the bucket was blocked or spaced again while we waited for the lock
+                continue
+            if got.verdict.kind is None:
+                return got.resp
+            if got.verdict.kind == "heavy":
+                raise StoppedOnAnswer(_gave_up(req.method, req.path), got.resp)
+            answers += 1
+            delay = max(1.0, got.delay)
+            if delay > tollbooth_throttle.MAX_WAIT or clock.mono() + delay > deadline or answers >= MAX_ANSWERS:
+                raise StoppedOnAnswer(limited(got.limited, delay, clock), got.resp)
+            eprint(f"gh-tollbooth: {got.limited} is rate-limited; waiting {delay:.0f} s (lock released)")
+            clock.sleep(delay)
+        raise core.busy("still blocked after repeated waits")
 
 
 def _send(req: _Request, clock: Clock, backoff: _Backoff, left: float) -> Tuple[_Answer, int, Dict[str, float]]:
@@ -119,15 +143,6 @@ def _send(req: _Request, clock: Clock, backoff: _Backoff, left: float) -> Tuple[
 
 
 # ---------- helpers ----------
-
-def _token(ctx: FetchContext) -> str:
-    """The token, asked for once per ctx: `gh auth token` starts a process."""
-    token = getattr(ctx, "token", None)
-    if token is None:
-        token = http.token()
-        setattr(ctx, "token", token)  # a cache, not part of FetchContext: callers don't provide it
-    return token
-
 
 def _summary(method: str, path: str, json_body: Optional[dict]) -> str:
     """What was asked, for the call log: the method, the path and a GraphQL document's text."""
