@@ -18,3 +18,16 @@ def primary(reset: float, status: int = 403, resource: str = "core") -> http.Res
 
 def secondary(retry_after: int | None = None, status: int = 429) -> http.Response:
     return answer(status, {"Retry-After": retry_after} if retry_after is not None else {})
+
+
+class FakeClock:
+    """A wall clock that moves only when a test says so: sleep() moves it on, `wall` can be set."""
+
+    def __init__(self):
+        self.wall = WALL0
+
+    def now(self) -> float:
+        return self.wall
+
+    def sleep(self, seconds: float) -> None:
+        self.wall += max(0.0, seconds)
