@@ -2,10 +2,12 @@
 
 The machine-wide lock is a filelock FileLock (flock on Unix) on `lock` in the shared state folder.
 The shared state (call times, blocks, budget charges and the call log) is one SQLite file there, state.db.
+A Deadline is one call's time budget: every wait asks it first, and it picks exit 75 or 76.
 Not here: settings, exit codes and errors (tollbooth_core).
 """
 from __future__ import annotations
 
+import datetime as dt
 import errno
 import os
 import re
@@ -20,7 +22,7 @@ from filelock import FileLock, Timeout
 from tenacity import retry, retry_if_exception, stop_after_attempt
 
 import tollbooth_core as core
-from tollbooth_core import EX_BUSY, EX_FAIL, TollboothError, log
+from tollbooth_core import EX_BUSY, EX_FAIL, EX_LIMITED, TollboothError, log
 
 T = TypeVar("T")
 
@@ -30,6 +32,7 @@ FS_RETRIES = 5             # tries for a file step whose folder someone deletes 
 VANISHED = (errno.ENOENT, errno.EEXIST, errno.EINVAL)
 LOCK_POLL = 0.2            # seconds between tries for a held lock
 WAIT_NOTICE = 5            # seconds of waiting for the lock before one "waiting" line on stderr
+MIN_CALL_TIME = 15         # seconds; no request starts with less time left (or half the deadline, if shorter)
 SPACING = {"graphql": 1.0, "core": 0.5, "search": 2.2, "code_search": 6.5}  # seconds between calls, per bucket
 BLOCK_CAP = 3600           # seconds; GitHub limits reset hourly, so a longer wait is recorded as one hour...
 BLOCK_STALE = 3700         # ...and a block further ahead than this can't be real (a clock step): it is ignored
@@ -69,6 +72,13 @@ def _busy(why: str) -> TollboothError:
                           "gh-tollbooth is busy, not rate-limited: wait a minute and retry once.", EX_BUSY)
 
 
+def _limited(what: str, seconds: float, clock: core.Clock) -> TollboothError:
+    """Exit 75: `what` is rate-limited for `seconds` more. Stop and report; don't retry in a loop."""
+    until = dt.datetime.fromtimestamp(clock.now() + seconds).strftime("%H:%M:%S")
+    return TollboothError(f"{what} is rate-limited until {until}. Stop and report; do not retry in a loop.",
+                          EX_LIMITED)
+
+
 def _printable(text: str) -> str:
     """`text` with control characters as "?", so nothing in the log can drive a terminal."""
     return CONTROL_RE.sub("?", text)
@@ -89,6 +99,48 @@ def _in_folder(folder: Path, step: Callable[[], T]) -> T:
     """
     folder.mkdir(parents=True, exist_ok=True)
     return step()
+
+
+# ---------- one call's time ----------
+
+class Deadline:
+    """One GitHub call's time budget: TOLLBOOTH_DEADLINE seconds of the monotonic clock, from its start.
+
+    Every wait asks it first, and it picks the exit code when a wait doesn't fit: 75 (rate-limited, stop)
+    when the wait is for a rate limit, 76 (busy, retry once) when it isn't.
+    """
+
+    def __init__(self, clock: core.Clock, seconds: float | None = None):
+        self.clock = clock
+        self.seconds = core.SETTINGS.deadline if seconds is None else seconds
+        self.at = clock.mono() + self.seconds
+
+    def left(self) -> float:
+        """Seconds until the deadline; negative once it has passed."""
+        return self.at - self.clock.mono()
+
+    def fits(self, wait: float) -> bool:
+        """True if a request can still start after waiting `wait` seconds.
+
+        MIN_CALL_TIME must be left for it then, or half the deadline if that is shorter.
+        """
+        return wait + min(MIN_CALL_TIME, self.seconds / 2) <= self.left()
+
+    def wait(self, seconds: float, limit: str | None = None) -> None:
+        """Sleep `seconds`, or stop if a request couldn't start afterwards.
+
+        `limit` names the rate limit the wait is for (a bucket, or "every bucket"): longer than
+        TOLLBOOTH_MAX_WAIT, or past the deadline, is exit 75. Any other wait that doesn't fit is exit 76.
+        A wait for a limit says so on stderr; every wait here is slept without the lock, but a call gap.
+        """
+        if limit is not None and (seconds > core.SETTINGS.max_wait or not self.fits(seconds)):
+            raise _limited(limit, seconds, self.clock)
+        if not self.fits(seconds):
+            raise _busy("not enough time left for another GitHub request")
+        if seconds > 0:
+            if limit is not None:
+                log.info("%s is rate-limited; waiting %.0f s (lock released)", limit, seconds)
+            self.clock.sleep(seconds)
 
 
 # ---------- shared throttle ----------
