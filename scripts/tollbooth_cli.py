@@ -141,7 +141,8 @@ def _global_options(command):
 def cli(ctx: click.Context, label: str | None, budget: int | None) -> None:
     """gh-tollbooth: one polite, shared, read-only request stream to GitHub for every agent on a machine.
 
-    It talks to the GitHub API directly, with the login `gh` already has (or GH_TOKEN).
+    It talks to the GitHub API directly, with the login `gh` already has (or GH_TOKEN). Agent guide and full
+    reference: SKILL.md.
 
     --budget caps the GitHub calls LABEL makes in 24 h. It is cooperative: it holds while every command
     passes it, and can't stop an agent that drops it, picks another label or calls GitHub another way.
