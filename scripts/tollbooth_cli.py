@@ -162,7 +162,7 @@ def cli(ctx: click.Context, label: str | None, budget: int | None) -> None:
 def status(ctx: click.Context, label: str | None, budget: int | None, last: int) -> None:
     """Rate-limit buckets and recent calls. Free: GitHub doesn't count it."""
     caller = _start(ctx, label, budget)
-    body = caller.rate_limit()  # outside the throttle (ADR-0001): it works while buckets are blocked
+    body = caller.rate_limit()  # outside the throttle (docs/design.md, Rate limits): it works while buckets are blocked
     try:
         resources = _RateLimit.model_validate_json(body).resources
     except ValidationError:

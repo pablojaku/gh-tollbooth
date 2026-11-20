@@ -13,7 +13,7 @@ A stop on GitHub's own answer (a 502/504, a rate limit the turn won't wait out) 
 that carries that answer, so a command can still show it.
 The Caller is the one seam between a command and GitHub: every failure comes out as a TollboothError
 with its exit code (no token or no answer: 1; a request tollbooth_http would refuse: 2), so a command
-catches one kind. Caller.rate_limit() asks GitHub's own counts outside the throttle (ADR-0001).
+catches one kind. Caller.rate_limit() asks GitHub's own counts outside the throttle (docs/design.md, Rate limits).
 Not here: the turn's rules (tollbooth_throttle), the HTTP request itself (tollbooth_http) and what a
 GraphQL request looks like in the call log (tollbooth_graphql).
 """
@@ -89,7 +89,7 @@ class Caller:
 
     def rate_limit(self) -> bytes:
         """GitHub's rate_limit document, asked for outside the throttle: no Budget charge, no call gap, no
-        Block check, no log line (ADR-0001). GitHub doesn't count it, and `status` is what you run while
+        Block check, no log line (docs/design.md, Rate limits). GitHub doesn't count it, and `status` is what you run while
         buckets are blocked. Another answer than 200, or none, is exit 1."""
         try:
             resp = http.send("GET", "rate_limit", self.token(), timeout=RATE_LIMIT_TIMEOUT)
