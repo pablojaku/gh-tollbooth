@@ -7,10 +7,11 @@ and sorts the entries. write_table() prints them as tsv, md or jsonl.
 
 It sends nothing to GitHub: re-ranking is free and needs no token or state folder.
 
-The files are untrusted. They are read only if they are regular files of at most 64 MB in total,
-and an error names the path, the line and the field, never a value from the file. Every text cell
-in a table is cleaned and cut to length, so a row can't break the table, send terminal codes or,
-in Markdown, form a link; a Markdown link is built from the repository's name, never its `url`.
+The files are untrusted. They are read only if they are regular files of at most 64 MB in total
+with rows nested at most 32 levels, and an error names the path, the line and the field, never a
+value from the file. Every text cell in a table is cleaned and cut to length, so a row can't break
+the table, send terminal codes or, in Markdown, form a link; a Markdown link is built from the
+repository's name, never its `url`.
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ from tollbooth_sweep import read_regular_file
 
 MAX_ROWS_BYTES = 64 * 1024 * 1024   # bytes, across all the files one command reads
 MAX_DIGITS = 20                     # digits in one JSON integer; Python 3.9 parses longer ones in quadratic time
+MAX_DEPTH = 32                      # levels of nesting in one row; a sweep row has 2 (the topics list)
 DESCRIPTION_CHARS = 100             # characters in a table's description cell
 SLICES_CHARS = 80                   # characters in a table's slices cell
 CELL_CHARS = 40                     # characters in any other text cell
@@ -111,14 +113,33 @@ def _parse(line: str, where: str) -> dict:
         value = json.loads(line, parse_int=_bounded_int)
     except _LongNumber:
         raise TollboothError(f"{where}: a number longer than {MAX_DIGITS} digits", EX_USAGE)
-    except (ValueError, RecursionError):  # never echo the parser's message: it quotes the line
+    except RecursionError:  # Python 3.13 and older give up on deep nesting before _too_deep can see it
+        raise TollboothError(f"{where}: nested more than {MAX_DEPTH} levels", EX_USAGE)
+    except ValueError:  # never echo the parser's message: it quotes the line
         raise TollboothError(f"{where}: not valid JSON", EX_USAGE)
+    if _too_deep(value):
+        raise TollboothError(f"{where}: nested more than {MAX_DEPTH} levels", EX_USAGE)
     if not isinstance(value, dict):
         raise TollboothError(f"{where}: expected a JSON object per line", EX_USAGE)
     bad = _bad_field(value)
     if bad:
         raise TollboothError(f"{where}: bad field '{bad}'", EX_USAGE)
     return value
+
+
+def _too_deep(value: object) -> bool:
+    """True if `value` nests more than MAX_DEPTH levels. Walked with a list, not recursion: Python 3.14 and
+    later parse JSON deeper than json.dumps can write back."""
+    stack: List[Tuple[object, int]] = [(value, 1)]
+    while stack:
+        v, depth = stack.pop()
+        children = v.values() if isinstance(v, dict) else v if isinstance(v, list) else None
+        if children is None:
+            continue
+        if depth > MAX_DEPTH:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 def _bounded_int(text: str) -> int:

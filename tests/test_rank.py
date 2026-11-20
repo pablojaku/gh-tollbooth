@@ -100,7 +100,14 @@ class Reader(FilesCase):
                          "not valid JSON")
         self.assertIn(":2: not valid JSON", self.refused(self.write(f"{good}\n{{'x': 1}}\n")))
         self.assertIn(":1: expected a JSON object per line", self.refused(self.write(f'["{SECRET}"]\n')))
-        self.assertIn(":1: not valid JSON", self.refused(self.write("[" * 100_000 + "]" * 100_000 + "\n")))
+
+    def test_rows_nested_deeper_than_32_levels(self):
+        # Python 3.13 and older run out of recursion on the deep lines; 3.14 and later parse them, and some
+        # (an object holding ~110,000 lists) can't be written back as jsonl. Every Python refuses them the same way.
+        for line in ("[" * 100_000 + "]" * 100_000, '{"a": ' + "[" * 110_000 + "]" * 110_000 + "}",
+                     '{"a": ' + "[" * 32 + "]" * 32 + "}"):
+            self.assertIn(":1: nested more than 32 levels", self.refused(self.write(line + "\n")))
+        self.assertEqual(len(ranking.read_rows([str(self.write('{"a": ' + "[" * 31 + "]" * 31 + "}\n"))])), 1)
 
     def test_a_number_longer_than_20_digits(self):
         self.assertEqual(len(ranking.read_rows([str(self.write('{"stargazerCount": -12345678901234567890}\n'))])),
