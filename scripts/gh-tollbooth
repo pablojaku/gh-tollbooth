@@ -7,6 +7,7 @@ Python 3.9+. Results go to stdout; progress goes to stderr.
   gh-tollbooth status                           rate-limit buckets + recent calls (free)
   gh-tollbooth call [--no-cache] -- api <args>  one read-only GitHub API request, throttled
   gh-tollbooth sweep QUERIES.tsv [--first N]    many repo searches, a few per GraphQL request
+  gh-tollbooth rank RAW.jsonl ... [options]     merge, filter and sort sweep rows (offline, free)
 
 `call` takes `gh api`'s form: one endpoint (or graphql) with -X GET|HEAD, -f/-F key=value,
 -H 'Accept: ...', -i and --silent. It prints GitHub's answer as it is: pipe it to jq to pick fields.
@@ -14,12 +15,15 @@ Python 3.9+. Results go to stdout; progress goes to stderr.
 `sweep` reads one `slice<TAB>query` per line and prints one JSON row per repository found (stars,
 language, topics, ..., plus the slice and query), 5 queries per request at the default --first 20.
 
+`rank` reads those rows and prints one line per repository (its newest row, how many queries hit it),
+filtered and sorted, as tsv, md or jsonl. It sends nothing to GitHub and needs no token.
+
 Global options (before or after the command, before `--`): --as LABEL  --budget N
 --budget caps the GitHub calls LABEL makes in 24 h. It is cooperative: it holds while every command
 passes it, and can't stop an agent that drops it, picks another label or calls GitHub another way.
 Exit codes: 0 ok; 1 no token, no answer from GitHub, an HTTP error answer or no state folder;
-2 usage or a request gh-tollbooth refuses; 3 GitHub gave up on all or part of a request; 4 budget used up;
-75 GitHub rate limit (stop and report the time); 76 busy or out of time (retry once later).
+2 usage, a request or an input file gh-tollbooth refuses; 3 GitHub gave up on all or part of a request;
+4 budget used up; 75 GitHub rate limit (stop and report the time); 76 busy or out of time (retry once later).
 
 Trust boundary: an agent may choose the arguments, never the environment. Python runs in isolated
 mode (-I), so PYTHONPATH can't put code into this process. The environment still picks the python3
@@ -36,8 +40,10 @@ import os
 import re
 import sys
 from contextlib import suppress
+from functools import partial
 from http.client import responses as REASONS
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tollbooth_core as core  # noqa: E402
@@ -45,6 +51,7 @@ import tollbooth_http as http  # noqa: E402
 from tollbooth_core import EX_FAIL, EX_USAGE, TollboothError, clock_in, eprint  # noqa: E402
 from tollbooth_guard import CallRequest, parse_call  # noqa: E402
 from tollbooth_loop import Caller, StoppedOnAnswer  # noqa: E402
+from tollbooth_rank import RankOptions, rank, read_rows, write_table  # noqa: E402
 from tollbooth_sweep import read_queries, sweep  # noqa: E402
 from tollbooth_throttle import Throttle  # noqa: E402
 
@@ -119,6 +126,23 @@ def cmd_sweep(caller: Caller, a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rank(a: argparse.Namespace) -> int:
+    """Sweep rows merged per repository, filtered and sorted. Offline: no token, no state folder, no request."""
+    rows = read_rows(a.files)
+    if sys.stdout is None:  # `>&-`: the table would be lost
+        raise TollboothError("stdout is closed, so the table would be lost: redirect it", EX_USAGE)
+    entries = rank(rows, RankOptions(a.min_stars, a.pushed_since, a.slice, a.by, a.top,
+                                     a.include_archived, a.include_forks))
+    write_table(entries, a.format, sys.stdout)
+    eprint(f"{len(entries)} repos from {len(rows)} rows (sorted by {a.by})")
+    return 0
+
+
+# Commands that talk to GitHub get the shared throttle and a Caller; offline commands get only their arguments.
+GITHUB_COMMANDS = {"status": cmd_status, "call": cmd_call, "sweep": cmd_sweep}
+OFFLINE_COMMANDS = {"rank": cmd_rank}
+
+
 def write_answer(resp: http.Response, req: CallRequest) -> None:
     """The answer on stdout: with -i the status line and headers first; with --silent nothing."""
     if req.silent:
@@ -145,6 +169,22 @@ def count(text: str) -> int:
     return n
 
 
+def day(text: str) -> dt.date:
+    """A real date written YYYY-MM-DD."""
+    try:
+        if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", text):
+            return dt.date.fromisoformat(text)
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("must be a real date written YYYY-MM-DD")
+
+
+def slice_name(text: str) -> str:
+    if not core.LABEL_RE.fullmatch(text):
+        raise argparse.ArgumentTypeError("a slice is 1 to 40 letters, digits, '.', '_' or '-'")
+    return text
+
+
 def build_parser() -> argparse.ArgumentParser:
     # allow_abbrev=False everywhere: argparse would otherwise read `--bud 5` as `--budget 5`
     common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
@@ -164,6 +204,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("queries", help="a .tsv file: one slice<TAB>query per line")
     s.add_argument("--first", type=int, default=20, help="results per query, 1 to 100 (default 20)")
     s.add_argument("--no-cache", action="store_true", help="accepted and ignored: gh-tollbooth doesn't cache")
+    s = sub.add_parser("rank", parents=[common], allow_abbrev=False,
+                       help="merge, filter and sort sweep rows (offline, free)")
+    s.add_argument("files", nargs="+", help="JSONL files that sweep wrote (64 MB in total)")
+    s.add_argument("--min-stars", type=count, default=0, metavar="N", help="drop repos with fewer stars")
+    s.add_argument("--pushed-since", type=day, default=None, metavar="YYYY-MM-DD",
+                   help="drop repos last pushed before this day")
+    s.add_argument("--slice", type=slice_name, default=None, help="keep repos a query of this slice found")
+    s.add_argument("--by", choices=("stars", "hits"), default="stars", help="sort by stars, or by hits then stars")
+    s.add_argument("--top", type=count, default=0, metavar="N", help="repos to print after sorting (default 0: all)")
+    s.add_argument("--format", choices=("tsv", "md", "jsonl"), default="tsv", help="output format (default tsv)")
+    s.add_argument("--include-archived", action="store_true", help="keep archived repos")
+    s.add_argument("--include-forks", action="store_true", help="keep forks")
     return p
 
 
@@ -190,16 +242,19 @@ def main(argv=None) -> int:
     if budget is not None and label == "anon":
         eprint("gh-tollbooth: --budget needs a unique --as LABEL (calls are counted per label)")
         return EX_USAGE
+    run: Callable[[], int]
+    if a.cmd in OFFLINE_COMMANDS:
+        run = partial(OFFLINE_COMMANDS[a.cmd], a)
+    else:
+        try:
+            throttle = Throttle(core.STATE_DIR)
+        except OSError as e:
+            eprint(f"gh-tollbooth: can't create the state folder {core.STATE_DIR} ({e.strerror or e}); "
+                   "set TOLLBOOTH_STATE_DIR to a folder you can write to")
+            return EX_FAIL
+        run = partial(GITHUB_COMMANDS[a.cmd], Caller(label, budget, throttle), a)
     try:
-        throttle = Throttle(core.STATE_DIR)
-    except OSError as e:
-        eprint(f"gh-tollbooth: can't create the state folder {core.STATE_DIR} ({e.strerror or e}); "
-               "set TOLLBOOTH_STATE_DIR to a folder you can write to")
-        return EX_FAIL
-    caller = Caller(label, budget, throttle)
-    handler = {"status": cmd_status, "call": cmd_call, "sweep": cmd_sweep}[a.cmd]
-    try:
-        code = handler(caller, a)
+        code = run()
         if sys.stdout is not None:  # None when stdout was closed (`>&-`)
             sys.stdout.flush()  # a closed pipe shows here when the output was small
         return code

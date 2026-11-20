@@ -41,6 +41,7 @@ STATE_DIR = Path(os.environ.get("TOLLBOOTH_STATE_DIR", str(Path.home() / ".cache
 SPACING = {"graphql": 1.0, "core": 0.5, "search": 2.2, "code_search": 6.5}  # seconds between calls, per bucket
 DEADLINE = env_seconds("TOLLBOOTH_DEADLINE", 100)   # per GitHub call; under the Bash tool's 120 s default
 LABEL_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # always use .fullmatch: "$" would accept a trailing newline
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")  # owner/name; always use .fullmatch, like LABEL_RE
 BLOCK_SANITY = 3700      # seconds; GitHub limits reset hourly, so a longer block is capped or stale
 # 1 = no token, no answer from GitHub, or no state folder; 75 = GitHub rate limit (stop, report the reset time);
 # 76 = gh-tollbooth busy or out of time (retry once later)
