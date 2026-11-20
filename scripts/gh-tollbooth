@@ -2,7 +2,7 @@
 """gh-tollbooth: one polite, shared, read-only request stream to GitHub for every agent on a machine.
 
 Talks to the GitHub API directly, with the login `gh` already has (or GH_TOKEN). Stdlib only,
-Python 3.9+. Results go to stdout; progress goes to stderr.
+Python 3.9+. Results go to stdout; progress goes to stderr. Agent guide and full reference: SKILL.md.
 
   gh-tollbooth status                           rate-limit buckets + recent calls (free)
   gh-tollbooth call [--no-cache] -- api <args>  one read-only GitHub API request, throttled
@@ -71,7 +71,7 @@ def _count(value) -> str:
 
 def cmd_status(caller: Caller, a: argparse.Namespace) -> int:
     # Asked directly, not through the throttle: GitHub doesn't count rate_limit against any bucket,
-    # and status is what you run while buckets are blocked (docs/adr/0001).
+    # and status is what you run while buckets are blocked (docs/design.md, "Rate limits").
     resp = http.send("GET", "rate_limit", caller.token(), timeout=30)
     if resp.status != 200:
         hint = " (GitHub rejected the token: run `gh auth login`, or check GH_TOKEN)" if resp.status == 401 else ""
