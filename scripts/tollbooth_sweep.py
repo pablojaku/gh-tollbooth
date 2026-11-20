@@ -14,7 +14,6 @@ the path and the line, never the file's text.
 """
 from __future__ import annotations
 
-import datetime as dt
 import json
 import os
 import stat
@@ -114,7 +113,7 @@ def sweep(caller: Caller, queries: List[Query], first: int, out: TextIO) -> int:
     caller.check("graphql")  # a spent budget or a long block fails before any work
     per = max(1, min(MAX_BATCH, NODE_BUDGET // first))
     batches = [queries[i:i + per] for i in range(0, len(queries), per)]
-    run = _Run(caller, out, _iso(caller.throttle.clock.now()))
+    run = _Run(caller, out, graphql.fetched_at(caller.throttle.clock.now()))
     for i, batch in enumerate(batches, 1):
         eprint(f"[{i}/{len(batches)}] slices: {', '.join(sorted({q.slice for q in batch}))}")
         run.batch(batch, first)
@@ -124,10 +123,6 @@ def sweep(caller: Caller, queries: List[Query], first: int, out: TextIO) -> int:
                              f"(slices: {slices}); the rows printed are incomplete", EX_HEAVY)
     eprint(f"PASS: {len(queries)} queries, {run.written} rows")
     return run.written
-
-
-def _iso(wall: float) -> str:
-    return dt.datetime.fromtimestamp(wall, dt.timezone.utc).isoformat(timespec="seconds")
 
 
 class _Run:

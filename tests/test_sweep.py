@@ -160,6 +160,12 @@ class Batches(SweepCase):
         self.assertIn("PASS: 2 queries, 2 rows", err)
         self.assertIn("cost 1, graphql left 4999", err)
 
+    def test_a_description_loses_hidden_characters(self):
+        hidden = dict(repo("o/a"), description="x\u200by\U000e0041z\u202e!")
+        github = GitHub(lambda n, body: answer(200, body=json.dumps({"data": {"q0": {"nodes": [hidden]}}}).encode()))
+        rows, _, _ = self.run_sweep(queries("A"), github)
+        self.assertEqual(rows[0]["description"], "xyz!")
+
     def test_each_request_is_a_query_only_document_with_its_variables(self):
         github = GitHub()
         self.run_sweep(queries("A", "B"), github, first=30)

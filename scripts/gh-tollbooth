@@ -8,6 +8,7 @@ Python 3.9+. Results go to stdout; progress goes to stderr.
   gh-tollbooth call [--no-cache] -- api <args>  one read-only GitHub API request, throttled
   gh-tollbooth sweep QUERIES.tsv [--first N]    many repo searches, a few per GraphQL request
   gh-tollbooth rank RAW.jsonl ... [options]     merge, filter and sort sweep rows (offline, free)
+  gh-tollbooth repos owner/name ... [options]   details and READMEs, a few repos per GraphQL request
 
 `call` takes `gh api`'s form: one endpoint (or graphql) with -X GET|HEAD, -f/-F key=value,
 -H 'Accept: ...', -i and --silent. It prints GitHub's answer as it is: pipe it to jq to pick fields.
@@ -17,6 +18,9 @@ language, topics, ..., plus the slice and query), 5 queries per request at the d
 
 `rank` reads those rows and prints one line per repository (its newest row, how many queries hit it),
 filtered and sorted, as tsv, md or jsonl. It sends nothing to GitHub and needs no token.
+
+`repos` prints one JSON row per repository (release, open issues, last commit, ..., and with --readme
+the start of its README) for the names given and, with --from RAW.jsonl --top N, rank's top N.
 
 Global options (before or after the command, before `--`): --as LABEL  --budget N
 --budget caps the GitHub calls LABEL makes in 24 h. It is cooperative: it holds while every command
@@ -52,6 +56,7 @@ from tollbooth_core import EX_FAIL, EX_USAGE, TollboothError, clock_in, eprint  
 from tollbooth_guard import CallRequest, parse_call  # noqa: E402
 from tollbooth_loop import Caller, StoppedOnAnswer  # noqa: E402
 from tollbooth_rank import RankOptions, rank, read_rows, write_table  # noqa: E402
+from tollbooth_repos import MAX_README_CHARS, repos, shortlist  # noqa: E402
 from tollbooth_sweep import read_queries, sweep  # noqa: E402
 from tollbooth_throttle import Throttle  # noqa: E402
 
@@ -126,6 +131,15 @@ def cmd_sweep(caller: Caller, a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_repos(caller: Caller, a: argparse.Namespace) -> int:
+    """Details (and READMEs) for a list of repositories; one JSON row per repository on stdout."""
+    names = shortlist(a.names, a.from_files or [], a.top)  # a refused name or file costs nothing
+    if sys.stdout is None:  # `>&-`: every row would be lost
+        raise TollboothError("stdout is closed, so the rows would be lost: redirect it to a file", EX_USAGE)
+    repos(caller, names, a.readme, a.readme_chars, sys.stdout)
+    return 0
+
+
 def cmd_rank(a: argparse.Namespace) -> int:
     """Sweep rows merged per repository, filtered and sorted. Offline: no token, no state folder, no request."""
     rows = read_rows(a.files)
@@ -139,7 +153,7 @@ def cmd_rank(a: argparse.Namespace) -> int:
 
 
 # Commands that talk to GitHub get the shared throttle and a Caller; offline commands get only their arguments.
-GITHUB_COMMANDS = {"status": cmd_status, "call": cmd_call, "sweep": cmd_sweep}
+GITHUB_COMMANDS = {"status": cmd_status, "call": cmd_call, "sweep": cmd_sweep, "repos": cmd_repos}
 OFFLINE_COMMANDS = {"rank": cmd_rank}
 
 
@@ -179,6 +193,17 @@ def day(text: str) -> dt.date:
     raise argparse.ArgumentTypeError("must be a real date written YYYY-MM-DD")
 
 
+def readme_chars(text: str) -> int:
+    """README characters per repository: a whole number from 1 to MAX_README_CHARS."""
+    try:
+        n = int(text)
+    except ValueError:
+        n = 0
+    if not 1 <= n <= MAX_README_CHARS:
+        raise argparse.ArgumentTypeError(f"must be a whole number from 1 to {MAX_README_CHARS}")
+    return n
+
+
 def slice_name(text: str) -> str:
     if not core.LABEL_RE.fullmatch(text):
         raise argparse.ArgumentTypeError("a slice is 1 to 40 letters, digits, '.', '_' or '-'")
@@ -216,6 +241,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--format", choices=("tsv", "md", "jsonl"), default="tsv", help="output format (default tsv)")
     s.add_argument("--include-archived", action="store_true", help="keep archived repos")
     s.add_argument("--include-forks", action="store_true", help="keep forks")
+    s = sub.add_parser("repos", parents=[common], allow_abbrev=False,
+                       help="details and READMEs for repos named, or rank's top N of --from rows")
+    s.add_argument("names", nargs="*", metavar="owner/name", help="repos to fetch, before any taken from --from")
+    s.add_argument("--from", dest="from_files", action="append", default=None, metavar="RAW.jsonl",
+                   help="sweep rows: add their repos in rank's order (repeatable, 64 MB in total)")
+    s.add_argument("--top", type=count, default=0, metavar="N", help="repos to take from --from (default 0: all)")
+    s.add_argument("--readme", action="store_true", help="add the start of each README (5 repos per request)")
+    s.add_argument("--readme-chars", type=readme_chars, default=3000, metavar="N",
+                   help=f"README characters per repo, 1 to {MAX_README_CHARS} (default 3000)")
+    s.add_argument("--no-cache", action="store_true", help="accepted and ignored: gh-tollbooth doesn't cache")
     return p
 
 

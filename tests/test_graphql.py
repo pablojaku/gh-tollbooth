@@ -25,6 +25,30 @@ class SearchDoc(unittest.TestCase):
         self.assertIn("rateLimit { cost remaining resetAt }", doc)
 
 
+class ReposDoc(unittest.TestCase):
+    def test_names_only_as_variables_and_the_detail_fields(self):
+        doc = graphql.repos_doc(2, readme=False)
+        guard.check_graphql_document(doc)
+        self.assertTrue(doc.startswith("query($o0: String!, $n0: String!, $o1: String!, $n1: String!) {"))
+        self.assertIn("r0: repository(owner: $o0, name: $n0) {", doc)
+        self.assertIn("r1: repository(owner: $o1, name: $n1) {", doc)
+        self.assertNotIn("r2:", doc)
+        for part in ("nameWithOwner", "homepageUrl", "latestRelease { tagName publishedAt }",
+                     "issues(states: OPEN) { totalCount }",
+                     "defaultBranchRef { target { ... on Commit { committedDate } } }",
+                     "repositoryTopics(first: 6)", "rateLimit { cost remaining resetAt }"):
+            self.assertIn(part, doc)
+        self.assertNotIn("object(", doc)
+
+    def test_readme_aliases_only_when_asked(self):
+        doc = graphql.repos_doc(1, readme=True)
+        guard.check_graphql_document(doc)
+        paths = ("README.md", "readme.md", "Readme.md", "README.rst", "README", "README.markdown", "README.txt")
+        for j, path in enumerate(paths):
+            self.assertIn(f'rm{j}: object(expression: "HEAD:{path}") {{ ... on Blob {{ text }} }}', doc)
+        self.assertNotIn(f"rm{len(paths)}:", doc)
+
+
 class Flatten(unittest.TestCase):
     def test_a_repository_node_becomes_one_flat_row(self):
         node = {"nameWithOwner": "o/r", "stargazerCount": 7, "description": None, "isFork": False,
@@ -40,6 +64,57 @@ class Flatten(unittest.TestCase):
         row = graphql.flatten(node)
         self.assertEqual((row["language"], row["license"], row["topics"]), (None, None, ["ok"]))
         self.assertEqual(graphql.flatten({"repositoryTopics": "junk"})["topics"], [])
+
+
+    def test_a_detail_node_adds_release_issues_last_commit_and_readme(self):
+        node = {"nameWithOwner": "o/r", "homepageUrl": "https://o.example", "repositoryTopics": {"nodes": []},
+                "latestRelease": {"tagName": "v2", "publishedAt": "2026-11-01T00:00:00Z"}, "issues": {"totalCount": 4},
+                "defaultBranchRef": {"target": {"committedDate": "2026-11-19T10:00:00Z"}},
+                "rm0": None, "rm1": {"text": ""}, "rm2": {"text": "# Title\nbody"}, "rm3": {"text": "second"}}
+        self.assertEqual(graphql.flatten(node), {
+            "nameWithOwner": "o/r", "homepageUrl": "https://o.example", "language": None, "license": None, "topics": [],
+            "release": "v2", "releasedAt": "2026-11-01T00:00:00Z", "openIssues": 4,
+            "lastCommit": "2026-11-19T10:00:00Z",
+            "readme": "# Title\nbody"})
+
+    def test_detail_fields_of_the_wrong_shape_read_as_missing(self):
+        node = {"latestRelease": None, "issues": {"totalCount": True}, "defaultBranchRef": {"target": "x"},
+                "rm0": {"text": 5}, "rm1": "junk", "rm2": None}
+        row = graphql.flatten(node)
+        self.assertEqual([row[k] for k in ("release", "releasedAt", "openIssues", "lastCommit", "readme")], [None] * 5)
+        self.assertEqual(graphql.flatten({"latestRelease": {"tagName": 7}, "issues": {"totalCount": 3}})["release"],
+                         None)
+
+    def test_a_search_node_gets_no_detail_fields(self):
+        row = graphql.flatten({"nameWithOwner": "o/r", "stargazerCount": 1})
+        for key in ("release", "releasedAt", "openIssues", "lastCommit", "readme"):
+            self.assertNotIn(key, row)
+
+    def test_the_readme_is_cut_after_cleaning(self):
+        row = graphql.flatten({"rm0": {"text": "\u200b" * 10 + "abcdef"}}, readme_chars=3)
+        self.assertEqual(row["readme"], "abc")
+        self.assertEqual(len(graphql.flatten({"rm0": {"text": "x" * 5000}})["readme"]), graphql.README_CHARS)
+
+
+class Cleaning(unittest.TestCase):
+    """Text a repository's owner wrote loses what hides text from a reader but not from a model."""
+
+    # control characters, C1 controls, CR, zero-width, bidi, separators, BOM, word joiners and every tag character
+    HIDDEN = ("\x00\x07\x1b\x7f\x85\x9b\r\u200b\u200d\u200f\u202a\u202e\u2066\u2069\u2028\u2029\ufeff"
+              "\u2060\u2064" + "".join(map(chr, range(0xE0000, 0xE0080))))
+
+    def test_hidden_characters_leave_the_description_and_the_readme(self):
+        text = "a" + self.HIDDEN + "b\nc\td"
+        row = graphql.flatten({"description": text, "rm0": {"text": text}})
+        self.assertEqual((row["description"], row["readme"]), ("ab\nc\td", "ab\nc\td"))
+
+    def test_visible_text_is_kept(self):
+        text = "\u00dcn\u00efc\u00f6d\u00e9 \u2014 \u65e5\u672c \u2764\ufe0f [link](x) <b> | ok"
+        row = graphql.flatten({"description": text, "rm0": {"text": text}})
+        self.assertEqual((row["description"], row["readme"]), (text, text))
+
+    def test_other_fields_are_left_as_github_sent_them(self):
+        self.assertEqual(graphql.flatten({"homepageUrl": "x\u200by"})["homepageUrl"], "x\u200by")
 
 
 class Errors(unittest.TestCase):

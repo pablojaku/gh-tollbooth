@@ -1,22 +1,28 @@
 """tollbooth_graphql: what gh-tollbooth knows about GitHub's GraphQL API. Stdlib only, Python 3.9+.
 
 - search_doc() builds one batched repository search: aliases q0..qN, one query variable each;
+- repos_doc() builds one batched repository lookup: aliases r0..rN, owner and name as variables,
+  plus the README at HEAD when asked;
 - post() sends a document through a Caller and returns GitHub's parsed answer;
-- flatten() turns a repository node into one flat JSON row;
+- flatten() turns a repository node into one flat JSON row; fetched_at() is the time rows carry;
 - error_aliases() and warnings() read the `errors` of an answer; cost_note() its rateLimit;
 - summary() describes a request for the call log; HEAVY_QUERY_ADVICE is what to do after a 502/504.
 
 GitHub's answers are read defensively: a value of the wrong type reads as missing, never as a crash,
-and text that goes to a terminal has its control characters replaced.
+and text that goes to a terminal has its control characters replaced. A repository's description and
+README are its owner's text, which agents read: flatten() removes the characters that hide text from a
+person but not from a model (control, zero-width, bidi, tag characters). Visible text stays as it is.
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import re
 from http.client import responses as REASONS
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from tollbooth_core import EX_FAIL, TollboothError
+from tollbooth_guard import BAD_CHARS_RE
 
 if TYPE_CHECKING:  # tollbooth_loop imports this module, so the Caller is only named for type checkers
     from tollbooth_loop import Caller
@@ -25,10 +31,19 @@ REPO_FIELDS = ("nameWithOwner url description stargazerCount forkCount pushedAt 
                "isArchived isFork primaryLanguage { name } licenseInfo { spdxId }")
 TOPICS = "repositoryTopics(first: 6) { nodes { topic { name } } }"
 RATE_LIMIT = "rateLimit { cost remaining resetAt }"
+DETAIL_FIELDS = ("homepageUrl latestRelease { tagName publishedAt } issues(states: OPEN) { totalCount } "
+                 "defaultBranchRef { target { ... on Commit { committedDate } } }")
+README_PATHS = ("README.md", "readme.md", "Readme.md", "README.rst", "README", "README.markdown", "README.txt")
+README_CHARS = 3000       # characters of README text in a row, by default
 HEAVY_QUERY_ADVICE = ("GitHub gave up on the query (502/504: its 10 s limit). Make it lighter: "
                       "fewer aliases, a smaller first:, fewer nested connections.")
 WARNING_CHARS = 200
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Beyond the guard's list (control characters except tab and newline, CR, zero-width, bidi, separators, BOM): C1
+# controls, word joiners and Unicode tag characters ("ASCII smuggling"). Built from code points, so the source file
+# itself holds no invisible characters.
+_MORE_HIDDEN = [*range(0x80, 0xA0), *range(0x2060, 0x2065), *range(0xE0000, 0xE0080)]
+MORE_HIDDEN_RE = re.compile("[" + re.escape("".join(map(chr, _MORE_HIDDEN))) + "]")
 
 
 def search_doc(n: int, first: int) -> str:
@@ -37,6 +52,17 @@ def search_doc(n: int, first: int) -> str:
     decl = ", ".join(f"$q{i}: String!" for i in range(n))
     body = " ".join(f"q{i}: search(query: $q{i}, type: REPOSITORY, first: {int(first)}) "
                     f"{{ repositoryCount nodes {{ ... on Repository {{ {fields} }} }} }}" for i in range(n))
+    return f"query({decl}) {{ {body} {RATE_LIMIT} }}"
+
+
+def repos_doc(n: int, readme: bool) -> str:
+    """One GraphQL query for `n` repositories (aliases r0..r{n-1}, variables $o0/$n0..), with their README if asked."""
+    fields = f"{REPO_FIELDS} {TOPICS} {DETAIL_FIELDS}"
+    if readme:
+        fields += " " + " ".join(f'rm{j}: object(expression: "HEAD:{path}") {{ ... on Blob {{ text }} }}'
+                                 for j, path in enumerate(README_PATHS))
+    decl = ", ".join(f"$o{i}: String!, $n{i}: String!" for i in range(n))
+    body = " ".join(f"r{i}: repository(owner: $o{i}, name: $n{i}) {{ {fields} }}" for i in range(n))
     return f"query({decl}) {{ {body} {RATE_LIMIT} }}"
 
 
@@ -72,19 +98,50 @@ def _at(value: object, *keys: str) -> object:
     return value
 
 
-def flatten(node: dict) -> dict:
-    """A repository node as one flat row: its scalar fields, plus language, license and topics."""
+def flatten(node: dict, readme_chars: int = README_CHARS) -> dict:
+    """A repository node as one flat row: its scalar fields, plus language, license and topics.
+
+    A node from repos_doc() also gives release, releasedAt, openIssues and lastCommit, and, if the README
+    was asked for, readme: the first README found, cleaned, then cut to `readme_chars` (None if none).
+    """
     row = {k: v for k, v in node.items() if not isinstance(v, (dict, list)) and v is not None}
+    if isinstance(row.get("description"), str):
+        row["description"] = _clean(row["description"])
     row["language"] = _text_or_none(_at(node, "primaryLanguage", "name"))
     row["license"] = _text_or_none(_at(node, "licenseInfo", "spdxId"))
     topics = _at(node, "repositoryTopics", "nodes")
     names = (_at(t, "topic", "name") for t in (topics if isinstance(topics, list) else []))
     row["topics"] = [n for n in names if isinstance(n, str)]
+    if "latestRelease" in node:
+        row["release"] = _text_or_none(_at(node, "latestRelease", "tagName"))
+        row["releasedAt"] = _text_or_none(_at(node, "latestRelease", "publishedAt"))
+    if "issues" in node:
+        row["openIssues"] = _int_or_none(_at(node, "issues", "totalCount"))
+    if "defaultBranchRef" in node:
+        row["lastCommit"] = _text_or_none(_at(node, "defaultBranchRef", "target", "committedDate"))
+    if any(f"rm{j}" in node for j in range(len(README_PATHS))):
+        texts = (_text_or_none(_at(node, f"rm{j}", "text")) for j in range(len(README_PATHS)))
+        cleaned = (_clean(t) for t in texts if t)
+        row["readme"] = next((t[:readme_chars] for t in cleaned if t), None)
     return row
+
+
+def _clean(text: str) -> str:
+    """The owner's text without the characters that hide text from a person but not from a model."""
+    return MORE_HIDDEN_RE.sub("", BAD_CHARS_RE.sub("", text))
+
+
+def fetched_at(wall: float) -> str:
+    """The time rows carry as `fetched`: ISO 8601 in UTC, to the second."""
+    return dt.datetime.fromtimestamp(wall, dt.timezone.utc).isoformat(timespec="seconds")
 
 
 def _text_or_none(value: object) -> Optional[str]:
     return value if isinstance(value, str) else None
+
+
+def _int_or_none(value: object) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def error_aliases(data: dict, aliases: List[str]) -> Dict[str, str]:
