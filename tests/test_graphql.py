@@ -196,5 +196,75 @@ class ErrorAnswers(SearchCase):
         self.assertEqual(cm.exception.code, core.EX_HEAVY)
 
 
+def detail(name="o/r", **changed):
+    """A repository node as GitHub sends it for the lookup document."""
+    raw = node(name, homepageUrl="https://example.org", latestRelease={"tagName": "v2", "publishedAt": "2026-11-02T00:00:00Z"},
+               issues={"totalCount": 7}, defaultBranchRef={"target": {"committedDate": "2026-11-18T00:00:00Z"}})
+    raw.update(changed)
+    return raw
+
+
+def lookup_reply(*nodes, errors=None):
+    """GitHub's answer to a lookup: r0, r1, ... in order (None is a null alias), plus rateLimit."""
+    data = {f"r{i}": n for i, n in enumerate(nodes)}
+    data["rateLimit"] = {"cost": 1, "remaining": 4998}
+    body = {"data": data} if errors is None else {"data": data, "errors": errors}
+    return answer(200, body=json.dumps(body).encode())
+
+
+class Lookup(SearchCase):
+    def lookup(self, names, readme=False, *replies):
+        self.answers = list(replies) or [lookup_reply(*[detail(n) for n in names])]
+        return gql.lookup(self.caller, list(names), readme)
+
+    def test_names_travel_only_as_owner_and_name_variables(self):
+        self.lookup(["octo/cat", "acme/kit"])
+        doc, variables = self.sent()["query"], self.sent()["variables"]
+        self.assertEqual(variables, {"o0": "octo", "n0": "cat", "o1": "acme", "n1": "kit"})
+        self.assertIn("r0: repository(owner: $o0, name: $n0)", doc)
+        self.assertIn("homepageUrl latestRelease { tagName publishedAt } issues(states: OPEN) { totalCount }", doc)
+        guard.check_graphql_document(doc)
+        self.assertNotIn("octo", doc)
+        self.assertNotIn("rm0:", doc)
+        self.assertEqual(self.throttle.used("lab"), 1)
+
+    def test_the_readme_files_only_when_asked(self):
+        self.lookup(["o/r"], True, lookup_reply(detail()))
+        doc = self.sent()["query"]
+        for j, path in enumerate(gql.README_PATHS):
+            self.assertIn(f'rm{j}: object(expression: "HEAD:{path}") {{ ... on Blob {{ text }} }}', doc)
+        guard.check_graphql_document(doc)
+
+    def test_a_node_becomes_a_repo_with_its_details(self):
+        (found,) = self.lookup(["o/r"]).found
+        repo = found.repo
+        assert repo is not None
+        self.assertEqual((repo.nameWithOwner, repo.homepageUrl, repo.release, repo.releasedAt, repo.openIssues,
+                          repo.lastCommit, repo.readme, found.error),
+                         ("o/r", "https://example.org", "v2", "2026-11-02T00:00:00Z", 7, "2026-11-18T00:00:00Z", None, None))
+
+    def test_detail_fields_of_the_wrong_shape_read_as_missing(self):
+        odd = detail(latestRelease="v1", issues={"totalCount": "7"}, defaultBranchRef={"target": None})
+        (found,) = self.lookup(["o/r"], False, lookup_reply(odd)).found
+        repo = found.repo
+        assert repo is not None
+        self.assertEqual((repo.release, repo.releasedAt, repo.openIssues, repo.lastCommit), (None, None, None, None))
+
+    def test_the_first_readme_found_without_its_hidden_characters(self):
+        readme = detail(rm0=None, rm1={"text": "\u200b\ufeff"}, rm2={"text": "# Tool\u202e\n\tline \u2764\ufe0f"},
+                        rm3={"text": "not this one"})
+        (found,) = self.lookup(["o/r"], True, lookup_reply(readme)).found
+        assert found.repo is not None
+        self.assertEqual(found.repo.readme, "# Tool\n\tline \u2764")  # rm1 is only hidden characters: skipped
+
+    def test_a_missing_repo_and_the_error_that_names_it(self):
+        errors = [{"type": "NOT_FOUND", "path": ["r0"], "message": "Could not resolve"},
+                  {"type": "SERVICE_UNAVAILABLE", "path": ["r1", "latestRelease"]}, {"path": ["r2"]}]
+        got = self.lookup(["o/gone", "o/part", "o/odd"], False,
+                          lookup_reply(None, detail("o/part", latestRelease=None), detail("o/odd"), errors=errors)).found
+        self.assertEqual([(f.repo is None, f.error) for f in got],
+                         [(True, "NOT_FOUND"), (False, "SERVICE_UNAVAILABLE"), (False, "")])
+
+
 if __name__ == "__main__":
     unittest.main()

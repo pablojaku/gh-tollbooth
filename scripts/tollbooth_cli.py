@@ -27,6 +27,7 @@ from pydantic import BaseModel, BeforeValidator, Field, ValidationError  # noqa:
 import tollbooth_core as core  # noqa: E402
 import tollbooth_http as http  # noqa: E402
 import tollbooth_rank  # noqa: E402
+import tollbooth_repos  # noqa: E402
 import tollbooth_sweep  # noqa: E402
 import tollbooth_throttle  # noqa: E402
 from tollbooth_guard import CallRequest, parse_call  # noqa: E402
@@ -283,6 +284,34 @@ def rank(label: str | None, budget: int | None, min_stars: int, pushed_since: dt
     entries = tollbooth_rank.rank(rows, options)
     tollbooth_rank.write_table(entries, fmt, sys.stdout)
     core.log.info("%d repos from %d rows (sorted by %s)", len(entries), len(rows), by)
+
+
+@cli.command()
+@_global_options
+@click.option("--from", "from_paths", multiple=True, metavar="RAW.jsonl",
+              help="Also fetch the repos in these sweep rows, in rank's order (repeatable; 64 MB in total).")
+@click.option("--top", type=click.IntRange(min=0), default=0, metavar="N",
+              help="Only the first N repos from --from; 0: all.")
+@click.option("--readme", is_flag=True, help="Also fetch each repo's README (5 repos per request instead of 20).")
+@click.option("--readme-chars", type=click.IntRange(1, tollbooth_repos.MAX_README_CHARS),
+              default=tollbooth_repos.README_CHARS, show_default=True, metavar="N", help="README characters per repo.")
+@click.option("--no-cache", is_flag=True, help="Accepted and ignored: gh-tollbooth doesn't cache.")
+@click.argument("names", nargs=-1, metavar="[OWNER/NAME]...")
+@click.pass_context
+def repos(ctx: click.Context, label: str | None, budget: int | None, from_paths: tuple[str, ...], top: int,
+          readme: bool, readme_chars: int, no_cache: bool, names: tuple[str, ...]) -> None:
+    """Details for repositories, and their READMEs if asked: one JSON row per repository on stdout.
+
+    \b
+    Names come from the command line first, then from --from rows (newest row per repo, most stars first,
+    archives and forks left out). A repo GitHub doesn't know gets an "error": "not found" row; exit 3 means
+    some came back incomplete, the rows printed are still good.
+    """
+    picked = tollbooth_repos.shortlist(list(names), list(from_paths), top)  # a refusal costs nothing
+    caller = _start(ctx, label, budget)
+    if sys.stdout is None:  # `>&-`: every row would be lost
+        raise core.TollboothError("stdout is closed, so the rows would be lost: redirect it to a file", core.EX_USAGE)
+    tollbooth_repos.repos(caller, picked, readme, readme_chars, sys.stdout)
 
 
 def _write_answer(resp: http.Response, req: CallRequest) -> None:

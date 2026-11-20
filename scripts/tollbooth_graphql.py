@@ -3,6 +3,9 @@
 - search() runs a batch of repository searches as one GraphQL query (one charged request through the
   Caller) and reads GitHub's answer: each query's repositories in order, the total GitHub counted, and
   whether the answer was complete; plus one warning per GraphQL error and the cost note;
+- lookup() asks for a batch of repositories by name the same way, with their details (homepage, latest
+  release, open issues, last commit) and, if asked, the first README it finds; each name comes back with its
+  RepoDetail (None if GitHub sent none) and the error GitHub reported on it, if any;
 - Repo is one repository from that answer, read defensively: a value of the wrong type reads as missing,
   never as a crash, and the description loses its hidden characters (tollbooth_text.strip_hidden);
 - summary() describes a request for the call log, a GraphQL document's text included;
@@ -35,6 +38,9 @@ REPO_FIELDS = ("nameWithOwner url description stargazerCount forkCount pushedAt 
                "isArchived isFork primaryLanguage { name } licenseInfo { spdxId }")
 TOPICS = "repositoryTopics(first: 6) { nodes { topic { name } } }"
 RATE_LIMIT = "rateLimit { cost remaining resetAt }"
+DETAIL_FIELDS = ("homepageUrl latestRelease { tagName publishedAt } issues(states: OPEN) { totalCount } "
+                 "defaultBranchRef { target { ... on Commit { committedDate } } }")
+README_PATHS = ("README.md", "readme.md", "Readme.md", "README.rst", "README", "README.markdown", "README.txt")
 WARNING_CHARS = 200        # a warning line is cut to this many characters
 
 
@@ -90,6 +96,18 @@ class Repo(BaseModel):
     license: Text = Field(None, validation_alias=AliasPath("licenseInfo", "spdxId"))
     topics: Annotated["list[str]", BeforeValidator(_topic_names)] = Field(
         default_factory=list, validation_alias=AliasPath("repositoryTopics", "nodes"))
+
+
+class RepoDetail(Repo):
+    """A repository looked up by name: a Repo plus its details. The README is the first of README_PATHS
+    that holds visible text, without its hidden characters; None if none does or it wasn't asked for."""
+
+    homepageUrl: Text = None
+    release: Text = Field(None, validation_alias=AliasPath("latestRelease", "tagName"))
+    releasedAt: Text = Field(None, validation_alias=AliasPath("latestRelease", "publishedAt"))
+    openIssues: Count = Field(None, validation_alias=AliasPath("issues", "totalCount"))
+    lastCommit: Text = Field(None, validation_alias=AliasPath("defaultBranchRef", "target", "committedDate"))
+    readme: str | None = None
 
 
 class _Search(BaseModel):
@@ -153,6 +171,65 @@ def search(caller: Caller, queries: Sequence[str], first: int) -> SearchAnswer:
     errored = {e.path[0] for e in answer.errors if e.path and isinstance(e.path[0], str)}
     found = [_found(answer.data.get(alias), alias in errored) for alias in variables]
     return SearchAnswer(found, [_warning(e) for e in answer.errors], _cost(answer.data.get("rateLimit")))
+
+
+@dataclass(frozen=True)
+class Looked:
+    """One name's answer: its RepoDetail, or None when GitHub sent none, and the type of the first GraphQL
+    error that names it (None if none does; "" for an error that gives no type)."""
+
+    repo: RepoDetail | None
+    error: str | None
+
+
+@dataclass(frozen=True)
+class LookupAnswer:
+    found: list[Looked]    # one per name, in the order given
+    warnings: list[str]    # one line per GraphQL error in the answer, hidden characters as "?"
+    cost: str              # "cost 1, graphql left 4999"
+
+
+def lookup(caller: Caller, names: Sequence[str], readme: bool) -> LookupAnswer:
+    """Ask for repositories by owner/name, with their details and, with `readme`, their README: one charged request.
+
+    Each name travels as two variables, owner and name, never in the document. Raises as search() does.
+    """
+    if not names:
+        raise ValueError("lookup() needs at least one name")
+    variables: dict[str, str] = {}
+    for i, name in enumerate(names):
+        variables[f"o{i}"], variables[f"n{i}"] = name.split("/", 1)
+    resp = caller.fetch("POST", "graphql", json_body={"query": _lookup_doc(len(names), readme), "variables": variables})
+    answer = _read(resp)
+    kinds: dict[str, str] = {}
+    for e in answer.errors:
+        if e.path and isinstance(e.path[0], str):
+            kinds.setdefault(e.path[0], e.type or "")
+    found = [Looked(_detail(answer.data.get(f"r{i}"), readme), kinds.get(f"r{i}")) for i in range(len(names))]
+    return LookupAnswer(found, [_warning(e) for e in answer.errors], _cost(answer.data.get("rateLimit")))
+
+
+def _lookup_doc(n: int, readme: bool) -> str:
+    """One query for `n` repositories (aliases r0..r{n-1}, variables $o0/$n0..), with their README if asked."""
+    fields = f"{REPO_FIELDS} {TOPICS} {DETAIL_FIELDS}"
+    if readme:
+        fields += " " + " ".join(f'rm{j}: object(expression: "HEAD:{path}") {{ ... on Blob {{ text }} }}'
+                                 for j, path in enumerate(README_PATHS))
+    decl = ", ".join(f"$o{i}: String!, $n{i}: String!" for i in range(n))
+    body = " ".join(f"r{i}: repository(owner: $o{i}, name: $n{i}) {{ {fields} }}" for i in range(n))
+    return f"query({decl}) {{ {body} {RATE_LIMIT} }}"
+
+
+def _detail(raw: object, readme: bool) -> RepoDetail | None:
+    if not isinstance(raw, dict):
+        return None
+    detail = RepoDetail.model_validate(raw)
+    if readme:
+        texts = (_text(f.get("text")) if isinstance(f := raw.get(f"rm{j}"), dict) else None
+                 for j in range(len(README_PATHS)))
+        cleaned = (strip_hidden(t) for t in texts if isinstance(t, str))
+        detail.readme = next((t for t in cleaned if t.strip()), None)
+    return detail
 
 
 def _search_doc(n: int, first: int) -> str:
