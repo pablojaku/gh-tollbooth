@@ -76,6 +76,14 @@ class Strip(unittest.TestCase):
         self.assertEqual(text.strip_hidden(VISIBLE), VISIBLE)
 
 
+class RepoName(unittest.TestCase):
+    def test_owner_slash_name(self):
+        for name in ("o/r", "Org-1/repo.name_2", "a/.github"):
+            self.assertTrue(text.REPO_RE.fullmatch(name), name)
+        for name in ("o", "o/r/x", "o/r b", "/r", "o/", "o/r\n", "o/r\u202e"):
+            self.assertFalse(text.REPO_RE.fullmatch(name), name)
+
+
 class ResourceName(unittest.TestCase):
     def test_only_lower_case_names_are_shown(self):
         for name in ("core", "graphql", "dependency_sbom", "a" * 40):

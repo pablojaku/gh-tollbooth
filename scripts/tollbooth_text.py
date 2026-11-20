@@ -6,8 +6,8 @@ see but a program or model still reads. An agent's argument may not carry one (h
 newline are allowed), nor argv bytes that weren't UTF-8 (is_utf8()); the guard refuses both. Everything
 gh-tollbooth prints goes through printable(), which shows each hidden character as "?", tab and newline
 included. Text a repository's owner wrote (a description, a README) goes through strip_hidden(), which
-removes them, so an emoji keeps its symbol. LABEL_RE is the form of a Label; RESOURCE_RE the form of a
-resource name a message may repeat.
+removes them, so an emoji keeps its symbol. LABEL_RE is the form of a Label; REPO_RE the form of a
+repository's owner/name; RESOURCE_RE the form of a resource name a message may repeat.
 Not here: what a request may ask GitHub (tollbooth_guard).
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ import re
 import unicodedata
 
 LABEL_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # always use .fullmatch: "$" would accept a trailing newline
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")  # owner/name; .fullmatch too
 RESOURCE_RE = re.compile(r"[a-z_]{1,40}")       # GitHub's rate-limit resources: core, graphql, dependency_sbom, ...
 
 # Hidden: controls (Cc), format characters such as zero-width, bidi and tag characters (Cf), line and

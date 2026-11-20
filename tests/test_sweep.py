@@ -6,7 +6,6 @@ Run: uv run pytest
 """
 import io
 import json
-import logging
 import os
 import tempfile
 import unittest
@@ -19,7 +18,7 @@ import tollbooth_http as http
 import tollbooth_loop as loop
 import tollbooth_sweep as sweeping
 import tollbooth_throttle as throttling
-from _fixtures import FakeClock, answer, primary, settings
+from _fixtures import FakeClock, Notices, answer, primary, settings
 
 SECRET = "aws_secret_access_key = FAKEsecretFAKEsecret"
 FETCHED = "2027-01-15T08:00:00+00:00"  # the FakeClock's wall time
@@ -122,17 +121,6 @@ class GitHub:
 
     def sizes(self):
         return [len(b["variables"]) for b in self.bodies]
-
-
-class Notices(logging.Handler):
-    """Takes the place of the stderr handler: keeps each notice's text."""
-
-    def __init__(self):
-        super().__init__()
-        self.lines: list[str] = []
-
-    def emit(self, record):
-        self.lines.append(record.getMessage())
 
 
 class SweepCase(unittest.TestCase):

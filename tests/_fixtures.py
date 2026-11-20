@@ -3,6 +3,7 @@ path (pyproject.toml)."""
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 from collections.abc import Iterator
 from pathlib import Path
@@ -44,6 +45,17 @@ def settings(**fields: Any) -> core.Settings:
     """Settings with `fields` set and the rest at their defaults, whatever TOLLBOOTH_* this machine has."""
     with clean_env():
         return core.Settings(**fields)
+
+
+class Notices(logging.Handler):
+    """Takes the place of gh-tollbooth's stderr handler (patch it into core.log.handlers): keeps each notice's text."""
+
+    def __init__(self):
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
 
 
 class FakeClock:

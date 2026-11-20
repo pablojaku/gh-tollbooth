@@ -26,6 +26,7 @@ from pydantic import BaseModel, BeforeValidator, Field, ValidationError  # noqa:
 
 import tollbooth_core as core  # noqa: E402
 import tollbooth_http as http  # noqa: E402
+import tollbooth_rank  # noqa: E402
 import tollbooth_sweep  # noqa: E402
 import tollbooth_throttle  # noqa: E402
 from tollbooth_guard import CallRequest, parse_call  # noqa: E402
@@ -146,8 +147,8 @@ def cli(ctx: click.Context, label: str | None, budget: int | None) -> None:
 
     \b
     Exit codes: 0 ok; 1 no token, no answer from GitHub, an HTTP error answer, no state folder or a bug;
-    2 usage or a request gh-tollbooth refuses; 3 GitHub gave up on all or part of a request; 4 budget used up;
-    75 GitHub rate limit (stop and report the time); 76 busy or out of time (retry once later).
+    2 usage, a request or an input file gh-tollbooth refuses; 3 GitHub gave up on all or part of a request;
+    4 budget used up; 75 GitHub rate limit (stop and report the time); 76 busy or out of time (retry once later).
     """
     ctx.obj = {"label": label, "budget": budget}
 
@@ -230,6 +231,58 @@ def sweep(ctx: click.Context, label: str | None, budget: int | None, first: int,
     if sys.stdout is None:  # `>&-`: every row would be lost
         raise core.TollboothError("stdout is closed, so the rows would be lost: redirect it to a file", core.EX_USAGE)
     tollbooth_sweep.sweep(caller, queries, first, sys.stdout)
+
+
+class _Day(click.ParamType):
+    """A real date written YYYY-MM-DD."""
+
+    name = "YYYY-MM-DD"
+
+    def convert(self, value: object, param: click.Parameter | None, ctx: click.Context | None) -> dt.date:
+        if isinstance(value, dt.date):
+            return value
+        if isinstance(value, str) and tollbooth_rank.DATE_RE.fullmatch(value):
+            try:
+                return dt.date.fromisoformat(value)
+            except ValueError:
+                pass
+        self.fail("must be a real date written YYYY-MM-DD", param, ctx)
+
+
+def _slice_name(ctx: click.Context, param: click.Parameter, value: str | None) -> str | None:
+    if value is not None and not LABEL_RE.fullmatch(value):
+        raise click.BadParameter("a slice is 1 to 40 letters, digits, '.', '_' or '-'")
+    return value
+
+
+@cli.command()
+@_global_options
+@click.option("--min-stars", type=click.IntRange(min=0), default=0, metavar="N", help="Drop repos with fewer stars.")
+@click.option("--pushed-since", type=_Day(), default=None, help="Drop repos last pushed before this day.")
+@click.option("--slice", "slice_", metavar="SLICE", callback=_slice_name, help="Keep repos a query of this slice found.")
+@click.option("--by", type=click.Choice(["stars", "hits"]), default="stars", show_default=True,
+              help="Sort by stars, or by hits (the queries that found a repo), then stars.")
+@click.option("--top", type=click.IntRange(min=0), default=0, metavar="N", help="Repos to print after sorting; 0: all.")
+@click.option("--format", "fmt", type=click.Choice(["tsv", "md", "jsonl"]), default="tsv", show_default=True,
+              help="Output format.")
+@click.option("--include-archived", is_flag=True, help="Keep archived repos.")
+@click.option("--include-forks", is_flag=True, help="Keep forks.")
+@click.argument("files", nargs=-1, required=True, metavar="RAW.jsonl...")
+def rank(label: str | None, budget: int | None, min_stars: int, pushed_since: dt.date | None, slice_: str | None,
+         by: str, top: int, fmt: str, include_archived: bool, include_forks: bool, files: tuple[str, ...]) -> None:
+    """Merge, filter and sort sweep rows: one line per repository. Offline: no token, no state folder, no request.
+
+    \b
+    Reads the JSONL files sweep wrote (64 MB in total). Each repository's newest row wins; its hits are the
+    distinct queries that found it. --as and --budget are accepted and ignored.
+    """
+    rows = tollbooth_rank.read_rows(list(files))  # a refused file prints nothing
+    if sys.stdout is None:  # `>&-`: the table would be lost
+        raise core.TollboothError("stdout is closed, so the table would be lost: redirect it", core.EX_USAGE)
+    options = tollbooth_rank.RankOptions(min_stars, pushed_since, slice_, by, top, include_archived, include_forks)
+    entries = tollbooth_rank.rank(rows, options)
+    tollbooth_rank.write_table(entries, fmt, sys.stdout)
+    core.log.info("%d repos from %d rows (sorted by %s)", len(entries), len(rows), by)
 
 
 def _write_answer(resp: http.Response, req: CallRequest) -> None:
