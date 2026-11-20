@@ -11,7 +11,8 @@
 GitHub's answers are read defensively: a value of the wrong type reads as missing, never as a crash,
 and text that goes to a terminal has its control characters replaced. A repository's description and
 README are its owner's text, which agents read: flatten() removes the characters that hide text from a
-person but not from a model (control, zero-width, bidi, tag characters). Visible text stays as it is.
+person but not from a model (control, zero-width, bidi, tag characters, variation selectors). Visible text
+stays as it is.
 """
 from __future__ import annotations
 
@@ -40,9 +41,11 @@ HEAVY_QUERY_ADVICE = ("GitHub gave up on the query (502/504: its 10 s limit). Ma
 WARNING_CHARS = 200
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # Beyond the guard's list (control characters except tab and newline, CR, zero-width, bidi, separators, BOM): C1
-# controls, word joiners and Unicode tag characters ("ASCII smuggling"). Built from code points, so the source file
-# itself holds no invisible characters.
-_MORE_HIDDEN = [*range(0x80, 0xA0), *range(0x2060, 0x2065), *range(0xE0000, 0xE0080)]
+# controls, the soft hyphen, word joiners, Unicode tag characters ("ASCII smuggling") and every variation selector
+# (Mongolian, U+FE00-FE0F, U+E0100-E01EF: "emoji smuggling" hides bytes in them after a visible character). An
+# emoji keeps its symbol and loses only the selector. Built from code points, so the source holds no invisible text.
+_MORE_HIDDEN = [*range(0x80, 0xA0), 0xAD, *range(0x180B, 0x1810), *range(0x2060, 0x2065), *range(0xFE00, 0xFE10),
+                *range(0xE0000, 0xE0080), *range(0xE0100, 0xE01F0)]
 MORE_HIDDEN_RE = re.compile("[" + re.escape("".join(map(chr, _MORE_HIDDEN))) + "]")
 
 

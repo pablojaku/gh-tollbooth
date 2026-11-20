@@ -99,9 +99,11 @@ class Flatten(unittest.TestCase):
 class Cleaning(unittest.TestCase):
     """Text a repository's owner wrote loses what hides text from a reader but not from a model."""
 
-    # control characters, C1 controls, CR, zero-width, bidi, separators, BOM, word joiners and every tag character
+    # control characters, C1 controls, CR, zero-width, bidi, separators, BOM, word joiners, every tag character,
+    # the soft hyphen and every variation selector (Mongolian, U+FE00-FE0F, U+E0100-E01EF: "emoji smuggling")
     HIDDEN = ("\x00\x07\x1b\x7f\x85\x9b\r\u200b\u200d\u200f\u202a\u202e\u2066\u2069\u2028\u2029\ufeff"
-              "\u2060\u2064" + "".join(map(chr, range(0xE0000, 0xE0080))))
+              "\u2060\u2064\u00ad\u180b\u180e\u180f" + "".join(map(chr, range(0xE0000, 0xE0080)))
+              + "".join(map(chr, range(0xFE00, 0xFE10))) + "".join(map(chr, range(0xE0100, 0xE01F0))))
 
     def test_hidden_characters_leave_the_description_and_the_readme(self):
         text = "a" + self.HIDDEN + "b\nc\td"
@@ -109,9 +111,12 @@ class Cleaning(unittest.TestCase):
         self.assertEqual((row["description"], row["readme"]), ("ab\nc\td", "ab\nc\td"))
 
     def test_visible_text_is_kept(self):
-        text = "\u00dcn\u00efc\u00f6d\u00e9 \u2014 \u65e5\u672c \u2764\ufe0f [link](x) <b> | ok"
+        text = "\u00dcn\u00efc\u00f6d\u00e9 \u2014 \u65e5\u672c \u2764 [link](x) <b> | ok"
         row = graphql.flatten({"description": text, "rm0": {"text": text}})
         self.assertEqual((row["description"], row["readme"]), (text, text))
+
+    def test_an_emoji_keeps_its_symbol_without_the_variation_selector(self):
+        self.assertEqual(graphql.flatten({"description": "\u2764\ufe0f ok"})["description"], "\u2764 ok")
 
     def test_other_fields_are_left_as_github_sent_them(self):
         self.assertEqual(graphql.flatten({"homepageUrl": "x\u200by"})["homepageUrl"], "x\u200by")
