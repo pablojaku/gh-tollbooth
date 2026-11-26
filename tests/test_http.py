@@ -11,7 +11,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, cast
+from typing import Any, Callable, cast
 from unittest import mock
 
 from _fixtures import WALL0, answer, http, primary, secondary
@@ -220,6 +220,7 @@ class NoAnswer(LoopbackCase):
             self.assertEqual(cm.exception.kind, "error")
 
     def test_the_timeout_is_a_positive_number_of_at_most_an_hour(self):
+        bad: Any  # the point is to pass values of the wrong type
         for bad in (float("nan"), float("inf"), 0, -1, None, "5", True, 3601, 1e10):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 http.send("GET", "repos/o/r", TOKEN, timeout=bad)
@@ -350,6 +351,7 @@ class Classify(unittest.TestCase):
         self.assertEqual((v.kind, v.delay), ("secondary", None))
         v = http.classify(primary(now + 100, resource="search"), now)
         self.assertEqual((v.kind, v.bucket), ("primary", "search"))
+        assert v.delay is not None
         self.assertAlmostEqual(v.delay, 102, delta=0.01)
         self.assertEqual(http.classify(primary(now - 100), now).delay, 1.0)  # reset in the past: tiny, not negative
         self.assertIsNone(http.classify(answer(403, ok_headers), now).kind)  # a permission error
